@@ -255,7 +255,7 @@ func (s *CPASyncService) Status(ctx context.Context) (*cpaSyncStatusResponse, er
 	if err != nil {
 		return nil, err
 	}
-	s.normalizeState(state, time.Now().UTC())
+	s.normalizeState(state, settings, time.Now().UTC())
 
 	return &cpaSyncStatusResponse{
 		Config:           settings.summary(),
@@ -286,7 +286,7 @@ func (s *CPASyncService) ForceSwitch(ctx context.Context) (*cpaSyncStatusRespons
 		s.running.Store(false)
 		return nil, err
 	}
-	s.normalizeState(state, time.Now().UTC())
+	s.normalizeState(state, settings, time.Now().UTC())
 	if missing := settings.missingMihomoConfig(); len(missing) > 0 {
 		s.recordStateFailure(state, "switch_error", fmt.Sprintf("missing config: %s", strings.Join(missing, ", ")))
 		_ = s.db.UpdateCPASyncState(ctx, state)
@@ -359,7 +359,7 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 		return nil, err
 	}
 	now := time.Now().UTC()
-	s.normalizeState(state, now)
+	s.normalizeState(state, settings, now)
 
 	if !allowWhenDisabled && !settings.Enabled {
 		s.recordSkip(state, "disabled")
@@ -680,6 +680,13 @@ func (c *cpaSyncSettings) switchCooldown() time.Duration {
 	return time.Duration(c.SwitchAfterUploads) * time.Minute
 }
 
+func (c *cpaSyncSettings) uploadSwitchWindow() time.Duration {
+	if cooldown := c.switchCooldown(); cooldown > 0 {
+		return cooldown
+	}
+	return time.Hour
+}
+
 func (c *cpaSyncSettings) resolvedMihomoDelayTestURL() string {
 	if c == nil || strings.TrimSpace(c.MihomoDelayTestURL) == "" {
 		return defaultMihomoDelayTestURL
@@ -706,14 +713,26 @@ func (c *cpaSyncSettings) summary() cpaSyncConfigSummary {
 	}
 }
 
-func (s *CPASyncService) normalizeState(state *database.CPASyncState, now time.Time) bool {
+func (s *CPASyncService) normalizeState(state *database.CPASyncState, settings *cpaSyncSettings, now time.Time) bool {
 	if state == nil {
 		return false
 	}
 	changed := false
-	hourStart := now.Truncate(time.Hour).Format(time.RFC3339)
-	if state.HourBucketStart == "" || state.HourBucketStart != hourStart {
-		state.HourBucketStart = hourStart
+	windowStart := now.UTC()
+	windowDuration := time.Hour
+	if settings != nil {
+		windowDuration = settings.uploadSwitchWindow()
+	}
+	if state.HourBucketStart != "" {
+		if parsed, err := time.Parse(time.RFC3339, state.HourBucketStart); err == nil && !parsed.IsZero() {
+			if now.Before(parsed.Add(windowDuration)) {
+				windowStart = parsed
+			}
+		}
+	}
+	windowStartRaw := windowStart.Format(time.RFC3339)
+	if state.HourBucketStart == "" || state.HourBucketStart != windowStartRaw {
+		state.HourBucketStart = windowStartRaw
 		state.HourlyUploadCount = 0
 		state.ConsecutiveUploadCount = 0
 		changed = true
@@ -735,13 +754,6 @@ func (s *CPASyncService) shouldAutoSwitchForHourlyLimit(state *database.CPASyncS
 	}
 	if settings.MaxUploadsPerHour <= 0 || state.HourlyUploadCount < settings.MaxUploadsPerHour {
 		return false, ""
-	}
-	if state.HourBucketStart != "" && state.LastSwitchAt != "" {
-		if hourStart, err := time.Parse(time.RFC3339, state.HourBucketStart); err == nil {
-			if lastSwitch, err := time.Parse(time.RFC3339, state.LastSwitchAt); err == nil && !lastSwitch.Before(hourStart) {
-				return false, "already switched in current hour"
-			}
-		}
 	}
 	return true, ""
 }
@@ -1190,6 +1202,10 @@ func (s *CPASyncService) switchMihomo(ctx context.Context, settings *cpaSyncSett
 		now := time.Now().UTC().Format(time.RFC3339)
 		state.CurrentMihomoNode = candidate
 		state.LastSwitchAt = now
+		if reason == "hourly_upload_limit" {
+			state.HourBucketStart = now
+			state.HourlyUploadCount = 0
+		}
 		state.LastRunAt = now
 		state.LastRunStatus = "switch_success"
 		state.LastRunSummary = fmt.Sprintf("reason=%s, node=%s", reason, candidate)

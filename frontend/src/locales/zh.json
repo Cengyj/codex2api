@@ -659,7 +659,7 @@
     "statusTitle": "运行状态",
     "runtimeDesc": "首屏集中展示存量、上传计数、最近任务结果和错误摘要，方便快速巡检。",
     "cpaCount": "CPA 当前账号数",
-    "hourlyUploads": "本小时已上传",
+    "hourlyUploads": "当前窗口已上传",
     "consecutiveUploads": "切换前累计上传",
     "lastSwitchAt": "上次自动切换",
     "currentNode": "当前 Mihomo 节点",

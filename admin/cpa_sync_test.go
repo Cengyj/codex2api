@@ -576,8 +576,8 @@ func TestRunOnceSwitchesMihomoWhenHourlyUploadCountReachesLimit(t *testing.T) {
 	if status.State.LastSwitchAt == "" {
 		t.Fatal("LastSwitchAt is empty, want recorded switch time")
 	}
-	if status.State.HourlyUploadCount != 1 {
-		t.Fatalf("HourlyUploadCount = %d, want 1", status.State.HourlyUploadCount)
+	if status.State.HourlyUploadCount != 0 {
+		t.Fatalf("HourlyUploadCount = %d, want 0 after successful threshold switch reset", status.State.HourlyUploadCount)
 	}
 }
 
@@ -586,7 +586,7 @@ func TestShouldAutoSwitchForHourlyLimitIgnoresTimeCooldownWhenThresholdReached(t
 
 	now := time.Date(2026, 4, 6, 10, 10, 0, 0, time.UTC)
 	state := &database.CPASyncState{
-		HourBucketStart:   now.Truncate(time.Hour).Format(time.RFC3339),
+		HourBucketStart:   now.Add(-5 * time.Minute).Format(time.RFC3339),
 		HourlyUploadCount: 100,
 		LastSwitchAt:      now.Add(-10 * time.Minute).Format(time.RFC3339),
 	}
@@ -596,15 +596,6 @@ func TestShouldAutoSwitchForHourlyLimitIgnoresTimeCooldownWhenThresholdReached(t
 	}
 
 	ok, reason := service.shouldAutoSwitchForHourlyLimit(state, settings, now)
-	if ok {
-		t.Fatalf("ok = %t, want false because it already switched in current hour", ok)
-	}
-	if reason != "already switched in current hour" {
-		t.Fatalf("reason = %q, want %q", reason, "already switched in current hour")
-	}
-
-	state.LastSwitchAt = now.Add(-20 * time.Minute).Add(-1 * time.Hour).Format(time.RFC3339)
-	ok, reason = service.shouldAutoSwitchForHourlyLimit(state, settings, now)
 	if !ok {
 		t.Fatalf("ok = %t, want true when threshold reached before configured time window; reason=%q", ok, reason)
 	}
