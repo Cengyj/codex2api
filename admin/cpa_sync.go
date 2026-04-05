@@ -430,7 +430,7 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 				} else if kind == "usage_limit_reached" {
 					s.markRateLimited(matched.ID, record.StatusMessage)
 				}
-			} else if kind != "account_deactivated" && kind != "token_invalidated" && kind != "proxy_runtime_error" && localAccountCandidateCount(localRows, remote) == 0 {
+			} else if kind != "account_deactivated" && kind != "token_invalidated" && localAccountCandidateCount(localRows, remote) == 0 {
 				importedID, importName, err := s.importRemoteAccount(ctx, remote)
 				if err != nil {
 					s.recordAction(state, "reconcile", "error", fmt.Sprintf("create local account failed: %v", err), record.Name)
@@ -1517,10 +1517,6 @@ func detectCPAErrorKind(statusMessage string) string {
 		strings.Contains(lower, "authentication token has been invalidated"),
 		strings.Contains(lower, "signing in again"):
 		return "token_invalidated"
-	case strings.Contains(lower, "proxyconnect tcp:"),
-		strings.Contains(lower, "connect: connection refused"),
-		strings.Contains(lower, "dial tcp"):
-		return "proxy_runtime_error"
 	default:
 		return ""
 	}

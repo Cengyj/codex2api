@@ -362,39 +362,6 @@ func TestRunOnceMarksMatchedTokenInvalidatedAccountUnauthorized(t *testing.T) {
 	}
 }
 
-func TestRunOnceDeletesProxyRuntimeErrorsWithoutImportingLocalAccount(t *testing.T) {
-	remote := &cpaDownloadedAccount{
-		RefreshToken: "rt-proxy-runtime",
-		AccessToken:  "at-proxy-runtime",
-		AccountID:    "acct-proxy-runtime",
-		Email:        "proxyruntime@example.com",
-		PlanType:     "free",
-	}
-	server := newCPATestServer(t, `Post "https://chatgpt.com/backend-api/codex/responses": proxyconnect tcp: dial tcp 23.144.92.105:4243: connect: connection refused`, remote)
-	defer server.Close()
-
-	service, db, store := newCPASyncTestService(t, server.URL)
-
-	status, err := service.RunOnce(context.Background())
-	if err != nil {
-		t.Fatalf("RunOnce() error: %v", err)
-	}
-	if status.State.LastCPAAccountCount != 0 {
-		t.Fatalf("LastCPAAccountCount = %d, want 0 after deleting proxy runtime error", status.State.LastCPAAccountCount)
-	}
-
-	rows, err := db.ListAllAccounts(context.Background())
-	if err != nil {
-		t.Fatalf("ListAllAccounts() error: %v", err)
-	}
-	if len(rows) != 0 {
-		t.Fatalf("len(rows) = %d, want 0", len(rows))
-	}
-	if len(store.Accounts()) != 0 {
-		t.Fatalf("len(store.Accounts()) = %d, want 0", len(store.Accounts()))
-	}
-}
-
 func TestRunOnceMarksMatchedUsageLimitAccountRateLimited(t *testing.T) {
 	remote := &cpaDownloadedAccount{
 		RefreshToken: "rt-existing",
