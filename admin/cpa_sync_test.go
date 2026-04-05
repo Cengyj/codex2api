@@ -581,6 +581,35 @@ func TestRunOnceSwitchesMihomoWhenHourlyUploadCountReachesLimit(t *testing.T) {
 	}
 }
 
+func TestShouldAutoSwitchForHourlyLimitIgnoresTimeCooldownWhenThresholdReached(t *testing.T) {
+	service, _, _ := newCPASyncTestService(t, "http://example.invalid")
+
+	now := time.Date(2026, 4, 6, 10, 10, 0, 0, time.UTC)
+	state := &database.CPASyncState{
+		HourBucketStart:   now.Truncate(time.Hour).Format(time.RFC3339),
+		HourlyUploadCount: 100,
+		LastSwitchAt:      now.Add(-10 * time.Minute).Format(time.RFC3339),
+	}
+	settings := &cpaSyncSettings{
+		MaxUploadsPerHour:  100,
+		SwitchAfterUploads: 30,
+	}
+
+	ok, reason := service.shouldAutoSwitchForHourlyLimit(state, settings, now)
+	if ok {
+		t.Fatalf("ok = %t, want false because it already switched in current hour", ok)
+	}
+	if reason != "already switched in current hour" {
+		t.Fatalf("reason = %q, want %q", reason, "already switched in current hour")
+	}
+
+	state.LastSwitchAt = now.Add(-20 * time.Minute).Add(-1 * time.Hour).Format(time.RFC3339)
+	ok, reason = service.shouldAutoSwitchForHourlyLimit(state, settings, now)
+	if !ok {
+		t.Fatalf("ok = %t, want true when threshold reached before configured time window; reason=%q", ok, reason)
+	}
+}
+
 func TestSwitchMihomoRetriesNextCandidateWhenDelayTestFails(t *testing.T) {
 	mihomoServer, currentNode := newMihomoTestServer(t, "node-a", []string{"node-a", "node-b", "node-c"}, map[string]bool{
 		"node-b": true,

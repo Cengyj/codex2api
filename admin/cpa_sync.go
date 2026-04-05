@@ -743,14 +743,6 @@ func (s *CPASyncService) shouldAutoSwitchForHourlyLimit(state *database.CPASyncS
 			}
 		}
 	}
-	if cooldown := settings.switchCooldown(); cooldown > 0 && state.LastSwitchAt != "" {
-		if lastSwitch, err := time.Parse(time.RFC3339, state.LastSwitchAt); err == nil {
-			nextAllowed := lastSwitch.Add(cooldown)
-			if now.Before(nextAllowed) {
-				return false, fmt.Sprintf("switch cooldown active until %s", nextAllowed.UTC().Format(time.RFC3339))
-			}
-		}
-	}
 	return true, ""
 }
 
