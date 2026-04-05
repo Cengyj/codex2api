@@ -1258,15 +1258,18 @@ export default function CPASync() {
                         <Field label={t('cpaSync.minAccounts')}>
                           <Input type="number" min={0} value={form.cpa_min_accounts} onChange={(event) => updateForm({ cpa_min_accounts: Number(event.target.value) || 0 })} />
                         </Field>
-                        <Field label={t('cpaSync.maxAccounts')}>
-                          <Input type="number" min={0} value={form.cpa_max_accounts} onChange={(event) => updateForm({ cpa_max_accounts: Number(event.target.value) || 0 })} />
-                        </Field>
                         <Field label={t('cpaSync.maxUploadsPerHour')}>
                           <Input type="number" min={0} value={form.cpa_max_uploads_per_hour} onChange={(event) => updateForm({ cpa_max_uploads_per_hour: Number(event.target.value) || 0 })} />
                         </Field>
                         <Field label={t('cpaSync.switchAfterUploads')}>
                           <Input type="number" min={0} value={form.cpa_switch_after_uploads} onChange={(event) => updateForm({ cpa_switch_after_uploads: Number(event.target.value) || 0 })} />
                         </Field>
+                        <div className="rounded-3xl border border-border/80 bg-slate-50/90 px-4 py-4 text-sm leading-6 text-muted-foreground shadow-sm dark:bg-white/5 sm:col-span-2 xl:col-span-2">
+                          {t('cpaSync.switchRuleHint', {
+                            uploads: form.cpa_max_uploads_per_hour || 0,
+                            minutes: form.cpa_switch_after_uploads || 0,
+                          })}
+                        </div>
                       </ConfigSection>
 
                       <ConfigSection title={t('cpaSync.mihomoSection')} description={t('cpaSync.mihomoSectionDesc')}>
