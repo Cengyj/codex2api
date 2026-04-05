@@ -198,6 +198,7 @@ export interface SystemSettings {
   cpa_max_accounts: number
   cpa_max_uploads_per_hour: number
   cpa_switch_after_uploads: number
+  cpa_sync_interval_seconds: number
   mihomo_base_url: string
   mihomo_secret: string
   mihomo_strategy_group: string
@@ -217,6 +218,7 @@ export interface CPASyncState {
   hour_bucket_start: ISODateString
   hourly_upload_count: number
   consecutive_upload_count: number
+  last_switch_at: ISODateString
   last_run_at: ISODateString
   last_run_status: string
   last_run_summary: string
@@ -260,6 +262,7 @@ export interface CPASyncStatusResponse {
   cpa_test_status: ConnectionTestStatus
   mihomo_test_status: ConnectionTestStatus
   running: boolean
+  next_run_at?: ISODateString
 }
 
 export interface CPAExportEntry {

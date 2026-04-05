@@ -285,6 +285,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cpa_max_accounts INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cpa_max_uploads_per_hour INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cpa_switch_after_uploads INT DEFAULT 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cpa_sync_interval_seconds INT DEFAULT 300;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS mihomo_base_url VARCHAR(500) DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS mihomo_secret VARCHAR(255) DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS mihomo_strategy_group VARCHAR(255) DEFAULT '';
@@ -296,6 +297,7 @@ func (db *DB) migrate(ctx context.Context) error {
 		hour_bucket_start TIMESTAMPTZ NULL,
 		hourly_upload_count INT DEFAULT 0,
 		consecutive_upload_count INT DEFAULT 0,
+		last_switch_at TIMESTAMPTZ NULL,
 		last_run_at TIMESTAMPTZ NULL,
 		last_run_status VARCHAR(50) DEFAULT '',
 		last_run_summary TEXT DEFAULT '',
@@ -317,6 +319,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE cpa_sync_state ADD COLUMN IF NOT EXISTS hour_bucket_start TIMESTAMPTZ NULL;
 	ALTER TABLE cpa_sync_state ADD COLUMN IF NOT EXISTS hourly_upload_count INT DEFAULT 0;
 	ALTER TABLE cpa_sync_state ADD COLUMN IF NOT EXISTS consecutive_upload_count INT DEFAULT 0;
+	ALTER TABLE cpa_sync_state ADD COLUMN IF NOT EXISTS last_switch_at TIMESTAMPTZ NULL;
 	ALTER TABLE cpa_sync_state ADD COLUMN IF NOT EXISTS last_run_at TIMESTAMPTZ NULL;
 	ALTER TABLE cpa_sync_state ADD COLUMN IF NOT EXISTS last_run_status VARCHAR(50) DEFAULT '';
 	ALTER TABLE cpa_sync_state ADD COLUMN IF NOT EXISTS last_run_summary TEXT DEFAULT '';
@@ -437,36 +440,37 @@ func (db *DB) InsertAPIKey(ctx context.Context, name, key string) (int64, error)
 
 // SystemSettings 运行时设置项
 type SystemSettings struct {
-	MaxConcurrency        int
-	GlobalRPM             int
-	TestModel             string
-	TestConcurrency       int
-	ProxyURL              string
-	PgMaxConns            int
-	RedisPoolSize         int
-	AutoCleanUnauthorized bool
-	AutoCleanRateLimited  bool
-	AdminSecret           string
-	AutoCleanFullUsage    bool
-	AutoCleanError        bool
-	AutoCleanExpired      bool
-	ProxyPoolEnabled      bool
-	FastSchedulerEnabled  bool
-	MaxRetries            int
-	AllowRemoteMigration  bool
-	ModelMapping          string // JSON: {"anthropic_model": "codex_model", ...}
-	CPASyncEnabled        bool
-	CPABaseURL            string
-	CPAAdminKey           string
-	CPAMinAccounts        int
-	CPAMaxAccounts        int
-	CPAMaxUploadsPerHour  int
-	CPASwitchAfterUploads int
-	MihomoBaseURL         string
-	MihomoSecret          string
-	MihomoStrategyGroup   string
-	MihomoDelayTestURL    string
-	MihomoDelayTimeoutMs  int
+	MaxConcurrency         int
+	GlobalRPM              int
+	TestModel              string
+	TestConcurrency        int
+	ProxyURL               string
+	PgMaxConns             int
+	RedisPoolSize          int
+	AutoCleanUnauthorized  bool
+	AutoCleanRateLimited   bool
+	AdminSecret            string
+	AutoCleanFullUsage     bool
+	AutoCleanError         bool
+	AutoCleanExpired       bool
+	ProxyPoolEnabled       bool
+	FastSchedulerEnabled   bool
+	MaxRetries             int
+	AllowRemoteMigration   bool
+	ModelMapping           string // JSON: {"anthropic_model": "codex_model", ...}
+	CPASyncEnabled         bool
+	CPABaseURL             string
+	CPAAdminKey            string
+	CPAMinAccounts         int
+	CPAMaxAccounts         int
+	CPAMaxUploadsPerHour   int
+	CPASwitchAfterUploads  int
+	CPASyncIntervalSeconds int
+	MihomoBaseURL          string
+	MihomoSecret           string
+	MihomoStrategyGroup    string
+	MihomoDelayTestURL     string
+	MihomoDelayTimeoutMs   int
 }
 
 // GetSystemSettings 加载全局设置
@@ -489,6 +493,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(cpa_max_accounts, 0),
 		       COALESCE(cpa_max_uploads_per_hour, 0),
 		       COALESCE(cpa_switch_after_uploads, 0),
+		       COALESCE(cpa_sync_interval_seconds, 300),
 		       COALESCE(mihomo_base_url, ''),
 		       COALESCE(mihomo_secret, ''),
 		       COALESCE(mihomo_strategy_group, ''),
@@ -501,7 +506,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.ModelMapping,
 		&s.CPASyncEnabled, &s.CPABaseURL, &s.CPAAdminKey, &s.CPAMinAccounts, &s.CPAMaxAccounts,
-		&s.CPAMaxUploadsPerHour, &s.CPASwitchAfterUploads, &s.MihomoBaseURL, &s.MihomoSecret,
+		&s.CPAMaxUploadsPerHour, &s.CPASwitchAfterUploads, &s.CPASyncIntervalSeconds, &s.MihomoBaseURL, &s.MihomoSecret,
 		&s.MihomoStrategyGroup, &s.MihomoDelayTestURL, &s.MihomoDelayTimeoutMs,
 	)
 	if err == sql.ErrNoRows {
@@ -518,11 +523,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
 			fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping,
 			cpa_sync_enabled, cpa_base_url, cpa_admin_key, cpa_min_accounts, cpa_max_accounts,
-			cpa_max_uploads_per_hour, cpa_switch_after_uploads, mihomo_base_url, mihomo_secret,
+			cpa_max_uploads_per_hour, cpa_switch_after_uploads, cpa_sync_interval_seconds, mihomo_base_url, mihomo_secret,
 			mihomo_strategy_group, mihomo_delay_test_url, mihomo_delay_timeout_ms
 		)
 		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-		        $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+		        $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
 		ON CONFLICT (id) DO UPDATE SET
 			max_concurrency         = EXCLUDED.max_concurrency,
 			global_rpm              = EXCLUDED.global_rpm,
@@ -549,6 +554,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			cpa_max_accounts        = EXCLUDED.cpa_max_accounts,
 			cpa_max_uploads_per_hour = EXCLUDED.cpa_max_uploads_per_hour,
 			cpa_switch_after_uploads = EXCLUDED.cpa_switch_after_uploads,
+			cpa_sync_interval_seconds = EXCLUDED.cpa_sync_interval_seconds,
 			mihomo_base_url         = EXCLUDED.mihomo_base_url,
 			mihomo_secret           = EXCLUDED.mihomo_secret,
 			mihomo_strategy_group   = EXCLUDED.mihomo_strategy_group,
@@ -558,7 +564,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
 		s.CPASyncEnabled, s.CPABaseURL, s.CPAAdminKey, s.CPAMinAccounts, s.CPAMaxAccounts,
-		s.CPAMaxUploadsPerHour, s.CPASwitchAfterUploads, s.MihomoBaseURL, s.MihomoSecret,
+		s.CPAMaxUploadsPerHour, s.CPASwitchAfterUploads, s.CPASyncIntervalSeconds, s.MihomoBaseURL, s.MihomoSecret,
 		s.MihomoStrategyGroup, s.MihomoDelayTestURL, s.MihomoDelayTimeoutMs)
 	return err
 }

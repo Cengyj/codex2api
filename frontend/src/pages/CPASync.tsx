@@ -87,6 +87,7 @@ function pickCPASyncSettings(settings: SystemSettings): Partial<SystemSettings> 
     cpa_max_accounts: settings.cpa_max_accounts,
     cpa_max_uploads_per_hour: settings.cpa_max_uploads_per_hour,
     cpa_switch_after_uploads: settings.cpa_switch_after_uploads,
+    cpa_sync_interval_seconds: settings.cpa_sync_interval_seconds,
     mihomo_base_url: settings.mihomo_base_url,
     mihomo_secret: settings.mihomo_secret,
     mihomo_strategy_group: settings.mihomo_strategy_group,
@@ -248,6 +249,52 @@ function summarizeText(text: string | null | undefined, fallback = '--'): string
   const normalized = (text ?? '').replace(/\s+/g, ' ').trim()
   if (!normalized) return fallback
   return normalized.length > 64 ? `${normalized.slice(0, 64)}...` : normalized
+}
+
+function formatAbsoluteTime(value: string | null | undefined, fallback = '--'): string {
+  if (!value) return fallback
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return fallback
+  return parsed.toLocaleString('zh-CN', {
+    hour12: false,
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
+function formatCountdownParts(totalSeconds: number): string {
+  const seconds = Math.max(0, totalSeconds)
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const remainSeconds = seconds % 60
+  const parts: string[] = []
+
+  if (hours > 0) parts.push(`${hours}小时`)
+  if (minutes > 0) parts.push(`${minutes}分`)
+  if (parts.length < 2 || remainSeconds > 0) parts.push(`${remainSeconds}秒`)
+
+  return parts.slice(0, 3).join(' ')
+}
+
+function formatNextRunCountdown(
+  nextRunAt: string | null | undefined,
+  nowMs: number,
+  enabled: boolean,
+  running: boolean,
+  t: (key: string, options?: Record<string, unknown>) => string
+): string {
+  if (!enabled) return t('cpaSync.nextRunDisabled')
+  if (running) return t('cpaSync.runningNow')
+  if (!nextRunAt) return t('cpaSync.nextRunPending')
+
+  const diffMs = new Date(nextRunAt).getTime() - nowMs
+  if (!Number.isFinite(diffMs)) return t('cpaSync.nextRunPending')
+  if (diffMs <= 0) return t('cpaSync.nextRunSoon')
+
+  return `${formatCountdownParts(Math.ceil(diffMs / 1000))}后`
 }
 
 function buildMissingFieldsHint(fields: string[], t: (key: string, options?: Record<string, unknown>) => string): string {
@@ -472,6 +519,7 @@ export default function CPASync() {
   const [testingMihomo, setTestingMihomo] = useState(false)
   const [configOpen, setConfigOpen] = useState<boolean>(() => cpaSyncPageMemory.configOpen)
   const [activeView, setActiveView] = useState<CPASyncView>(() => cpaSyncPageMemory.activeView)
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const [mihomoGroups, setMihomoGroups] = useState<MihomoStrategyGroupOption[]>(() => cpaSyncPageMemory.mihomoGroups.length > 0 ? cpaSyncPageMemory.mihomoGroups : (initialMihomoServiceCache?.groups ?? []))
   const [mihomoServiceStatus, setMihomoServiceStatus] = useState<ConnectionTestStatus>(() => {
     if (cpaSyncPageMemory.mihomoServiceStatus.tested_at || cpaSyncPageMemory.mihomoServiceStatus.message) {
@@ -551,6 +599,15 @@ export default function CPASync() {
   const mihomoSecretValue = form?.mihomo_secret?.trim() ?? ''
   const recentActions = [...(status?.state.recent_actions ?? [])].reverse()
   const shouldAutoProbeMihomoService = Boolean(mihomoBaseValue && mihomoSecretValue) && lastMihomoFetchKey !== mihomoServiceSettingsSignature
+  const syncIntervalSeconds = status?.config.interval_seconds ?? form?.cpa_sync_interval_seconds ?? 300
+  const nextRunCountdown = formatNextRunCountdown(status?.next_run_at, nowMs, Boolean(form?.cpa_sync_enabled), Boolean(status?.running), t)
+  const nextRunDetail = !form?.cpa_sync_enabled
+    ? t('cpaSync.nextRunDisabledDesc')
+    : status?.running
+      ? t('cpaSync.nextRunRunningDesc')
+      : status?.next_run_at
+        ? `${formatAbsoluteTime(status.next_run_at)} · ${t('cpaSync.syncEverySeconds', { count: syncIntervalSeconds })}`
+        : t('cpaSync.nextRunPendingDesc')
 
   const patchSettings = useCallback((nextSettings: SystemSettings) => {
     setData((prev) => ({
@@ -565,6 +622,15 @@ export default function CPASync() {
       status: updater(prev.status),
     }))
   }, [setData])
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const nextStatus = await api.getCPASyncStatus()
+      patchStatus(() => nextStatus)
+    } catch {
+      // keep current status and retry in the next polling cycle
+    }
+  }, [patchStatus])
 
   useEffect(() => {
     if (!mihomoBaseValue || !mihomoSecretValue) return
@@ -615,6 +681,21 @@ export default function CPASync() {
     settingsForm,
     testSignatures,
   ])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now())
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    const intervalMs = status?.running ? 2000 : 10000
+    const timer = window.setInterval(() => {
+      void refreshStatus()
+    }, intervalMs)
+    return () => window.clearInterval(timer)
+  }, [refreshStatus, status?.running])
 
   const updateForm = (patch: Partial<SystemSettings>) => {
     setSettingsForm((prev) => {
@@ -731,6 +812,7 @@ export default function CPASync() {
           mihomo: shouldClearMihomoTest ? mihomoSettingsSignature : prev.mihomo,
         }))
       }
+      void refreshStatus()
       showToast(t('cpaSync.saveSuccess'))
     } catch (err) {
       showToast(`${t('cpaSync.saveFailed')}: ${getErrorMessage(err)}`, 'error')
@@ -862,6 +944,18 @@ export default function CPASync() {
               />
               <OverviewCard
                 icon={<Clock3 className="size-5" />}
+                label={t('cpaSync.nextRunAt')}
+                value={nextRunCountdown}
+                sub={nextRunDetail}
+                badge={
+                  <Badge className={status?.running ? infoBadgeClassName : (form.cpa_sync_enabled ? mutedBadgeClassName : warningBadgeClassName)}>
+                    <span className={`size-1.5 rounded-full ${status?.running ? 'bg-blue-500' : (form.cpa_sync_enabled ? 'bg-gray-400' : 'bg-amber-500')}`} />
+                    {t('cpaSync.syncEverySeconds', { count: syncIntervalSeconds })}
+                  </Badge>
+                }
+              />
+              <OverviewCard
+                icon={<Clock3 className="size-5" />}
                 label={t('cpaSync.lastRunAt')}
                 value={status?.state.last_run_at ? formatRelativeTime(status.state.last_run_at, { variant: 'compact' }) : '--'}
                 sub={summarizeText(status?.state.last_run_summary, t('cpaSync.awaitingRun'))}
@@ -926,8 +1020,9 @@ export default function CPASync() {
                   <div className="grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-3">
                     <StatusTile label={t('cpaSync.cpaCount')} value={String(status?.state.last_cpa_account_count ?? 0)} tone="neutral" />
                     <StatusTile label={t('cpaSync.hourlyUploads')} value={String(status?.state.hourly_upload_count ?? 0)} tone="success" />
-                    <StatusTile label={t('cpaSync.consecutiveUploads')} value={String(status?.state.consecutive_upload_count ?? 0)} tone="info" />
+                    <StatusTile label={t('cpaSync.lastSwitchAt')} value={status?.state.last_switch_at ? formatRelativeTime(status.state.last_switch_at, { variant: 'compact' }) : '--'} tone="info" />
                     <StatusTile label={t('cpaSync.currentNode')} value={status?.state.current_mihomo_node || '--'} tone="warning" />
+                    <StatusTile label={t('cpaSync.nextRunAt')} value={nextRunCountdown} tone={status?.running ? 'info' : 'neutral'} />
                   </div>
 
                   <div className="rounded-3xl border border-border bg-white/70 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.75)] dark:bg-white/5 dark:shadow-none">
@@ -1168,19 +1263,34 @@ export default function CPASync() {
                     </div>
 
                     <ConfigSection title={t('cpaSync.taskSection')} description={t('cpaSync.taskSectionDesc')}>
-                      <div className="rounded-3xl border border-border bg-white/70 px-4 py-4 shadow-sm dark:bg-white/5">
-                        <div className="flex flex-wrap items-center justify-between gap-4">
-                          <div>
-                            <div className="text-sm font-semibold text-foreground">{t('cpaSync.enabled')}</div>
-                            <div className="mt-1 text-xs text-muted-foreground">{t('cpaSync.taskToggleDesc')}</div>
+                      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_220px]">
+                        <div className="rounded-3xl border border-border bg-white/70 px-4 py-4 shadow-sm dark:bg-white/5">
+                          <div className="flex flex-wrap items-center justify-between gap-4">
+                            <div>
+                              <div className="text-sm font-semibold text-foreground">{t('cpaSync.enabled')}</div>
+                              <div className="mt-1 text-xs text-muted-foreground">{t('cpaSync.taskToggleDesc')}</div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => updateForm({ cpa_sync_enabled: !form.cpa_sync_enabled })}
+                              className={`inline-flex h-11 items-center rounded-2xl px-4 text-sm font-semibold transition-colors ${form.cpa_sync_enabled ? 'bg-emerald-500 text-white' : 'bg-muted text-muted-foreground'}`}
+                            >
+                              {form.cpa_sync_enabled ? t('common.enabled') : t('common.disabled')}
+                            </button>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => updateForm({ cpa_sync_enabled: !form.cpa_sync_enabled })}
-                            className={`inline-flex h-11 items-center rounded-2xl px-4 text-sm font-semibold transition-colors ${form.cpa_sync_enabled ? 'bg-emerald-500 text-white' : 'bg-muted text-muted-foreground'}`}
-                          >
-                            {form.cpa_sync_enabled ? t('common.enabled') : t('common.disabled')}
-                          </button>
+                        </div>
+
+                        <div className="rounded-3xl border border-border bg-white/70 px-4 py-4 shadow-sm dark:bg-white/5">
+                          <Field label={t('cpaSync.syncIntervalSeconds')}>
+                            <Input
+                              type="number"
+                              min={30}
+                              max={86400}
+                              value={form.cpa_sync_interval_seconds}
+                              onChange={(event) => updateForm({ cpa_sync_interval_seconds: Number(event.target.value) || 30 })}
+                            />
+                          </Field>
+                          <div className="mt-2 text-xs text-muted-foreground">{t('cpaSync.syncIntervalHint')}</div>
                         </div>
                       </div>
                     </ConfigSection>

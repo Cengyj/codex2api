@@ -24,20 +24,25 @@ import (
 )
 
 const (
-	cpaSyncInterval        = 5 * time.Minute
-	cpaSyncRequestTimeout  = 45 * time.Second
-	cpaSyncMaxRecentEvents = 30
+	defaultCPASyncInterval    = 5 * time.Minute
+	minCPASyncInterval        = 30 * time.Second
+	maxCPASyncInterval        = 24 * time.Hour
+	cpaSyncRequestTimeout     = 45 * time.Second
+	cpaSyncMaxRecentEvents    = 30
+	defaultMihomoDelayTestURL = "https://cp.cloudflare.com/generate_204"
 )
 
 var errCPASyncBusy = errors.New("CPA sync is already running")
 
 type CPASyncService struct {
-	store   *auth.Store
-	db      *database.DB
-	client  *http.Client
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
-	running atomic.Bool
+	store       *auth.Store
+	db          *database.DB
+	client      *http.Client
+	stopCh      chan struct{}
+	configCh    chan struct{}
+	wg          sync.WaitGroup
+	running     atomic.Bool
+	nextRunUnix atomic.Int64
 }
 
 type cpaSyncSettings struct {
@@ -48,6 +53,7 @@ type cpaSyncSettings struct {
 	MaxAccounts         int
 	MaxUploadsPerHour   int
 	SwitchAfterUploads  int
+	Interval            time.Duration
 	MihomoBaseURL       string
 	MihomoSecret        string
 	MihomoStrategyGroup string
@@ -76,6 +82,7 @@ type cpaSyncStatusResponse struct {
 	CPATestStatus    database.ConnectionTestStatus `json:"cpa_test_status"`
 	MihomoTestStatus database.ConnectionTestStatus `json:"mihomo_test_status"`
 	Running          bool                          `json:"running"`
+	NextRunAt        string                        `json:"next_run_at,omitempty"`
 }
 
 type cpaAuthFileRecord struct {
@@ -130,10 +137,11 @@ type cpaSyncConnectionTestRequest struct {
 
 func NewCPASyncService(store *auth.Store, db *database.DB) *CPASyncService {
 	return &CPASyncService{
-		store:  store,
-		db:     db,
-		client: &http.Client{Timeout: cpaSyncRequestTimeout},
-		stopCh: make(chan struct{}),
+		store:    store,
+		db:       db,
+		client:   &http.Client{Timeout: cpaSyncRequestTimeout},
+		stopCh:   make(chan struct{}),
+		configCh: make(chan struct{}, 1),
 	}
 }
 
@@ -141,18 +149,59 @@ func (s *CPASyncService) Start() {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		ticker := time.NewTicker(cpaSyncInterval)
-		defer ticker.Stop()
-
 		for {
+			settings, err := s.loadSettings(context.Background())
+			if err != nil {
+				log.Printf("[CPA Sync] load settings failed: %v", err)
+				s.setNextRunAt(time.Now().UTC().Add(defaultCPASyncInterval))
+				timer := time.NewTimer(defaultCPASyncInterval)
+				select {
+				case <-timer.C:
+				case <-s.configCh:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					continue
+				case <-s.stopCh:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					s.setNextRunAt(time.Time{})
+					return
+				}
+			}
+
+			if settings == nil || !settings.Enabled {
+				s.setNextRunAt(time.Time{})
+				select {
+				case <-s.configCh:
+					continue
+				case <-s.stopCh:
+					return
+				}
+			}
+
+			interval := settings.interval()
+			nextRunAt := time.Now().UTC().Add(interval)
+			s.setNextRunAt(nextRunAt)
+			timer := time.NewTimer(interval)
 			select {
-			case <-ticker.C:
+			case <-timer.C:
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 				if _, err := s.runOnce(ctx, "auto", false); err != nil && !errors.Is(err, errCPASyncBusy) {
 					log.Printf("[CPA Sync] scheduled run failed: %v", err)
 				}
 				cancel()
+			case <-s.configCh:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				continue
 			case <-s.stopCh:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				s.setNextRunAt(time.Time{})
 				return
 			}
 		}
@@ -168,6 +217,34 @@ func (s *CPASyncService) Stop() {
 	s.wg.Wait()
 }
 
+func (s *CPASyncService) NotifyConfigChanged() {
+	select {
+	case s.configCh <- struct{}{}:
+	default:
+	}
+}
+
+func (s *CPASyncService) setNextRunAt(next time.Time) {
+	if next.IsZero() {
+		s.nextRunUnix.Store(0)
+		return
+	}
+	s.nextRunUnix.Store(next.UTC().Unix())
+}
+
+func (s *CPASyncService) nextRunAt() string {
+	unix := s.nextRunUnix.Load()
+	if unix <= 0 {
+		return ""
+	}
+	return time.Unix(unix, 0).UTC().Format(time.RFC3339)
+}
+
+func (s *CPASyncService) statusAfterRun(ctx context.Context) (*cpaSyncStatusResponse, error) {
+	s.running.Store(false)
+	return s.Status(ctx)
+}
+
 func (s *CPASyncService) Status(ctx context.Context) (*cpaSyncStatusResponse, error) {
 	settings, err := s.loadSettings(ctx)
 	if err != nil {
@@ -177,23 +254,7 @@ func (s *CPASyncService) Status(ctx context.Context) (*cpaSyncStatusResponse, er
 	if err != nil {
 		return nil, err
 	}
-	changed := s.normalizeState(state, time.Now().UTC())
-
-	if settings.hasCPAConfig() {
-		if records, err := s.listCPAAuthFiles(ctx, settings); err == nil {
-			state.LastCPAAccountCount = len(records)
-			changed = true
-		}
-	}
-	if settings.hasMihomoConfig() {
-		if detail, err := s.getMihomoSelector(ctx, settings); err == nil && detail.Now != "" {
-			state.CurrentMihomoNode = detail.Now
-			changed = true
-		}
-	}
-	if changed {
-		_ = s.db.UpdateCPASyncState(ctx, state)
-	}
+	s.normalizeState(state, time.Now().UTC())
 
 	return &cpaSyncStatusResponse{
 		Config:           settings.summary(),
@@ -201,6 +262,7 @@ func (s *CPASyncService) Status(ctx context.Context) (*cpaSyncStatusResponse, er
 		CPATestStatus:    normalizeConnectionTestStatus(state.CPATestStatus),
 		MihomoTestStatus: normalizeConnectionTestStatus(state.MihomoTestStatus),
 		Running:          s.running.Load(),
+		NextRunAt:        s.nextRunAt(),
 	}, nil
 }
 
@@ -212,21 +274,22 @@ func (s *CPASyncService) ForceSwitch(ctx context.Context) (*cpaSyncStatusRespons
 	if !s.running.CompareAndSwap(false, true) {
 		return nil, errCPASyncBusy
 	}
-	defer s.running.Store(false)
 
 	settings, err := s.loadSettings(ctx)
 	if err != nil {
+		s.running.Store(false)
 		return nil, err
 	}
 	state, err := s.db.GetCPASyncState(ctx)
 	if err != nil {
+		s.running.Store(false)
 		return nil, err
 	}
 	s.normalizeState(state, time.Now().UTC())
 	if missing := settings.missingMihomoConfig(); len(missing) > 0 {
 		s.recordStateFailure(state, "switch_error", fmt.Sprintf("missing config: %s", strings.Join(missing, ", ")))
 		_ = s.db.UpdateCPASyncState(ctx, state)
-		return s.Status(ctx)
+		return s.statusAfterRun(ctx)
 	}
 
 	if err := s.switchMihomo(ctx, settings, state, "manual_switch"); err != nil {
@@ -239,7 +302,7 @@ func (s *CPASyncService) ForceSwitch(ctx context.Context) (*cpaSyncStatusRespons
 		state.LastErrorSummary = ""
 	}
 	_ = s.db.UpdateCPASyncState(ctx, state)
-	return s.Status(ctx)
+	return s.statusAfterRun(ctx)
 }
 
 func (s *CPASyncService) TestCPA(ctx context.Context, req *cpaSyncConnectionTestRequest) (*database.ConnectionTestStatus, error) {
@@ -247,16 +310,12 @@ func (s *CPASyncService) TestCPA(ctx context.Context, req *cpaSyncConnectionTest
 	if err != nil {
 		return nil, err
 	}
-	state, err := s.db.GetCPASyncState(ctx)
-	if err != nil {
-		return nil, err
-	}
 	result := s.runCPAConnectionTest(ctx, settings)
-	state.CPATestStatus = normalizeConnectionTestStatus(result)
-	if err := s.db.UpdateCPASyncState(ctx, state); err != nil {
+	normalized := normalizeConnectionTestStatus(result)
+	if err := s.db.UpdateCPASyncCPATestStatus(ctx, normalized); err != nil {
 		return nil, err
 	}
-	return &state.CPATestStatus, nil
+	return &normalized, nil
 }
 
 func (s *CPASyncService) TestMihomo(ctx context.Context, req *cpaSyncConnectionTestRequest) (*database.ConnectionTestStatus, error) {
@@ -264,16 +323,12 @@ func (s *CPASyncService) TestMihomo(ctx context.Context, req *cpaSyncConnectionT
 	if err != nil {
 		return nil, err
 	}
-	state, err := s.db.GetCPASyncState(ctx)
-	if err != nil {
-		return nil, err
-	}
 	result := s.runMihomoConnectionTest(ctx, settings)
-	state.MihomoTestStatus = normalizeConnectionTestStatus(result)
-	if err := s.db.UpdateCPASyncState(ctx, state); err != nil {
+	normalized := normalizeConnectionTestStatus(result)
+	if err := s.db.UpdateCPASyncMihomoTestStatus(ctx, normalized); err != nil {
 		return nil, err
 	}
-	return &state.MihomoTestStatus, nil
+	return &normalized, nil
 }
 
 func (s *CPASyncService) ListMihomoStrategyGroups(ctx context.Context, req *cpaSyncConnectionTestRequest) ([]mihomoStrategyGroupOption, error) {
@@ -291,14 +346,15 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 	if !s.running.CompareAndSwap(false, true) {
 		return nil, errCPASyncBusy
 	}
-	defer s.running.Store(false)
 
 	settings, err := s.loadSettings(ctx)
 	if err != nil {
+		s.running.Store(false)
 		return nil, err
 	}
 	state, err := s.db.GetCPASyncState(ctx)
 	if err != nil {
+		s.running.Store(false)
 		return nil, err
 	}
 	now := time.Now().UTC()
@@ -307,25 +363,26 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 	if !allowWhenDisabled && !settings.Enabled {
 		s.recordSkip(state, "disabled")
 		_ = s.db.UpdateCPASyncState(ctx, state)
-		return s.Status(ctx)
+		return s.statusAfterRun(ctx)
 	}
 	if missing := settings.missingCPAConfig(); len(missing) > 0 {
 		s.recordStateFailure(state, "skipped", fmt.Sprintf("missing config: %s", strings.Join(missing, ", ")))
 		_ = s.db.UpdateCPASyncState(ctx, state)
-		return s.Status(ctx)
+		return s.statusAfterRun(ctx)
 	}
 
 	records, err := s.listCPAAuthFiles(ctx, settings)
 	if err != nil {
 		s.recordStateFailure(state, "error", fmt.Sprintf("list CPA auth files failed: %v", err))
 		_ = s.db.UpdateCPASyncState(ctx, state)
-		return s.Status(ctx)
+		return s.statusAfterRun(ctx)
 	}
 
 	processedErrors := 0
 	uploadedCount := 0
 	firstErrorSummary := ""
 	downloadedTokens := make(map[string]struct{})
+	remainingRecords := append([]cpaAuthFileRecord{}, records...)
 	for _, record := range records {
 		kind := detectCPAErrorKind(record.StatusMessage)
 		if kind == "" {
@@ -398,12 +455,19 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 			}
 		} else {
 			s.recordAction(state, "delete", "success", "deleted remote CPA account", record.Name)
+			remainingRecords = removeCPAAuthFileRecordByName(remainingRecords, record.Name)
 		}
 	}
 
+	records = remainingRecords
 	if processedErrors > 0 {
 		if refreshed, err := s.listCPAAuthFiles(ctx, settings); err == nil {
 			records = refreshed
+		} else {
+			s.recordAction(state, "run", "warning", fmt.Sprintf("refresh CPA auth files after cleanup failed: %v", err), "")
+			if firstErrorSummary == "" {
+				firstErrorSummary = fmt.Sprintf("refresh CPA auth files after cleanup failed: %v", err)
+			}
 		}
 	}
 	state.LastCPAAccountCount = len(records)
@@ -449,24 +513,24 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 					}
 					uploadedCount++
 					state.HourlyUploadCount++
-					state.ConsecutiveUploadCount++
 					state.LastCPAAccountCount++
 					s.recordAction(state, "upload", "success", fmt.Sprintf("uploaded %s", candidate.Email), name)
-
-					if settings.SwitchAfterUploads > 0 && state.ConsecutiveUploadCount >= settings.SwitchAfterUploads {
-						if err := s.switchMihomo(ctx, settings, state, "upload_threshold"); err != nil {
-							s.recordAction(state, "switch", "error", fmt.Sprintf("switch failed: %v", err), settings.MihomoStrategyGroup)
-							if firstErrorSummary == "" {
-								firstErrorSummary = fmt.Sprintf("switch Mihomo failed: %v", err)
-							}
-						} else {
-							s.recordAction(state, "switch", "success", fmt.Sprintf("switched selector to %s", state.CurrentMihomoNode), settings.MihomoStrategyGroup)
-							state.ConsecutiveUploadCount = 0
-						}
-					}
 				}
 			}
 		}
+	}
+
+	if eligible, reason := s.shouldAutoSwitchForHourlyLimit(state, settings, now); eligible {
+		if err := s.switchMihomo(ctx, settings, state, "hourly_upload_limit"); err != nil {
+			s.recordAction(state, "switch", "error", fmt.Sprintf("switch failed: %v", err), settings.MihomoStrategyGroup)
+			if firstErrorSummary == "" {
+				firstErrorSummary = fmt.Sprintf("switch Mihomo failed: %v", err)
+			}
+		} else {
+			s.recordAction(state, "switch", "success", fmt.Sprintf("switched selector to %s", state.CurrentMihomoNode), settings.MihomoStrategyGroup)
+		}
+	} else if reason != "" && settings.MaxUploadsPerHour > 0 && state.HourlyUploadCount >= settings.MaxUploadsPerHour {
+		s.recordAction(state, "switch", "info", reason, settings.MihomoStrategyGroup)
 	}
 
 	state.LastRunAt = now.Format(time.RFC3339)
@@ -480,7 +544,7 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 	state.LastRunSummary = fmt.Sprintf("trigger=%s, cpa_count=%d, processed_errors=%d, uploaded=%d", trigger, state.LastCPAAccountCount, processedErrors, uploadedCount)
 	_ = s.db.UpdateCPASyncState(ctx, state)
 
-	return s.Status(ctx)
+	return s.statusAfterRun(ctx)
 }
 
 func (s *CPASyncService) loadSettings(ctx context.Context) (*cpaSyncSettings, error) {
@@ -495,6 +559,10 @@ func (s *CPASyncService) loadSettings(ctx context.Context) (*cpaSyncSettings, er
 	if delayTimeout <= 0 {
 		delayTimeout = 5000
 	}
+	intervalSeconds := raw.CPASyncIntervalSeconds
+	if intervalSeconds <= 0 {
+		intervalSeconds = int(defaultCPASyncInterval / time.Second)
+	}
 	return &cpaSyncSettings{
 		Enabled:             raw.CPASyncEnabled,
 		CPABaseURL:          strings.TrimRight(strings.TrimSpace(raw.CPABaseURL), "/"),
@@ -503,6 +571,7 @@ func (s *CPASyncService) loadSettings(ctx context.Context) (*cpaSyncSettings, er
 		MaxAccounts:         raw.CPAMaxAccounts,
 		MaxUploadsPerHour:   raw.CPAMaxUploadsPerHour,
 		SwitchAfterUploads:  raw.CPASwitchAfterUploads,
+		Interval:            time.Duration(intervalSeconds) * time.Second,
 		MihomoBaseURL:       strings.TrimRight(strings.TrimSpace(raw.MihomoBaseURL), "/"),
 		MihomoSecret:        strings.TrimSpace(raw.MihomoSecret),
 		MihomoStrategyGroup: strings.TrimSpace(raw.MihomoStrategyGroup),
@@ -590,12 +659,39 @@ func (c *cpaSyncSettings) hasMihomoConfig() bool {
 	return len(c.missingMihomoConfig()) == 0
 }
 
+func (c *cpaSyncSettings) interval() time.Duration {
+	if c == nil || c.Interval <= 0 {
+		return defaultCPASyncInterval
+	}
+	if c.Interval < minCPASyncInterval {
+		return minCPASyncInterval
+	}
+	if c.Interval > maxCPASyncInterval {
+		return maxCPASyncInterval
+	}
+	return c.Interval
+}
+
+func (c *cpaSyncSettings) switchCooldown() time.Duration {
+	if c == nil || c.SwitchAfterUploads <= 0 {
+		return 0
+	}
+	return time.Duration(c.SwitchAfterUploads) * time.Minute
+}
+
+func (c *cpaSyncSettings) resolvedMihomoDelayTestURL() string {
+	if c == nil || strings.TrimSpace(c.MihomoDelayTestURL) == "" {
+		return defaultMihomoDelayTestURL
+	}
+	return strings.TrimSpace(c.MihomoDelayTestURL)
+}
+
 func (c *cpaSyncSettings) summary() cpaSyncConfigSummary {
 	missing := append([]string{}, c.missingCPAConfig()...)
 	missing = append(missing, c.missingMihomoConfig()...)
 	return cpaSyncConfigSummary{
 		Enabled:               c.Enabled,
-		IntervalSeconds:       int(cpaSyncInterval / time.Second),
+		IntervalSeconds:       int(c.interval() / time.Second),
 		CPABaseURL:            c.CPABaseURL,
 		CPAMinAccounts:        c.MinAccounts,
 		CPAMaxAccounts:        c.MaxAccounts,
@@ -618,6 +714,11 @@ func (s *CPASyncService) normalizeState(state *database.CPASyncState, now time.T
 	if state.HourBucketStart == "" || state.HourBucketStart != hourStart {
 		state.HourBucketStart = hourStart
 		state.HourlyUploadCount = 0
+		state.ConsecutiveUploadCount = 0
+		changed = true
+	}
+	if state.ConsecutiveUploadCount != 0 {
+		state.ConsecutiveUploadCount = 0
 		changed = true
 	}
 	if state.RecentActions == nil {
@@ -625,6 +726,31 @@ func (s *CPASyncService) normalizeState(state *database.CPASyncState, now time.T
 		changed = true
 	}
 	return changed
+}
+
+func (s *CPASyncService) shouldAutoSwitchForHourlyLimit(state *database.CPASyncState, settings *cpaSyncSettings, now time.Time) (bool, string) {
+	if state == nil || settings == nil {
+		return false, ""
+	}
+	if settings.MaxUploadsPerHour <= 0 || state.HourlyUploadCount < settings.MaxUploadsPerHour {
+		return false, ""
+	}
+	if state.HourBucketStart != "" && state.LastSwitchAt != "" {
+		if hourStart, err := time.Parse(time.RFC3339, state.HourBucketStart); err == nil {
+			if lastSwitch, err := time.Parse(time.RFC3339, state.LastSwitchAt); err == nil && !lastSwitch.Before(hourStart) {
+				return false, "already switched in current hour"
+			}
+		}
+	}
+	if cooldown := settings.switchCooldown(); cooldown > 0 && state.LastSwitchAt != "" {
+		if lastSwitch, err := time.Parse(time.RFC3339, state.LastSwitchAt); err == nil {
+			nextAllowed := lastSwitch.Add(cooldown)
+			if now.Before(nextAllowed) {
+				return false, fmt.Sprintf("switch cooldown active until %s", nextAllowed.UTC().Format(time.RFC3339))
+			}
+		}
+	}
+	return true, ""
 }
 
 func (s *CPASyncService) recordAction(state *database.CPASyncState, kind, status, message, target string) {
@@ -641,6 +767,20 @@ func (s *CPASyncService) recordAction(state *database.CPASyncState, kind, status
 	if len(state.RecentActions) > cpaSyncMaxRecentEvents {
 		state.RecentActions = append([]database.CPASyncAction{}, state.RecentActions[len(state.RecentActions)-cpaSyncMaxRecentEvents:]...)
 	}
+}
+
+func removeCPAAuthFileRecordByName(records []cpaAuthFileRecord, name string) []cpaAuthFileRecord {
+	if len(records) == 0 {
+		return records
+	}
+	filtered := make([]cpaAuthFileRecord, 0, len(records))
+	for _, record := range records {
+		if record.Name == name {
+			continue
+		}
+		filtered = append(filtered, record)
+	}
+	return filtered
 }
 
 func (s *CPASyncService) recordSkip(state *database.CPASyncState, reason string) {
@@ -805,10 +945,11 @@ func (s *CPASyncService) runMihomoConnectionTest(ctx context.Context, settings *
 }
 
 func (s *CPASyncService) runMihomoDelayTest(ctx context.Context, settings *cpaSyncSettings) (map[string]any, error) {
+	testURL := settings.resolvedMihomoDelayTestURL()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/proxies/%s/delay?url=%s&timeout=%d",
 		settings.MihomoBaseURL,
 		url.PathEscape(settings.MihomoStrategyGroup),
-		url.QueryEscape(settings.MihomoDelayTestURL),
+		url.QueryEscape(testURL),
 		settings.MihomoDelayTimeout,
 	), nil)
 	if err != nil {
@@ -826,13 +967,20 @@ func (s *CPASyncService) runMihomoDelayTest(ctx context.Context, settings *cpaSy
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(body, &decoded); err != nil {
-		return map[string]any{"delay_message": "delay test ok"}, nil
+		return map[string]any{
+			"delay_message": "delay test ok",
+			"tested_url":    testURL,
+		}, nil
 	}
 	result := map[string]any{
 		"delay_message": "delay test ok",
+		"tested_url":    testURL,
 	}
 	for _, key := range []string{"delay", "meanDelay"} {
 		if value, ok := decoded[key]; ok {
+			if delay, ok := int64FromAny(value); ok && delay <= 0 {
+				return nil, fmt.Errorf("delay test failed: invalid %s=%d", key, delay)
+			}
 			result["delay_value"] = value
 			break
 		}
@@ -1025,9 +1173,6 @@ func (s *CPASyncService) switchMihomo(ctx context.Context, settings *cpaSyncSett
 	if !settings.hasMihomoConfig() {
 		return fmt.Errorf("missing Mihomo config")
 	}
-	if settings.MihomoDelayTestURL != "" {
-		_ = s.triggerMihomoDelay(ctx, settings)
-	}
 
 	detail, err := s.getMihomoSelector(ctx, settings)
 	if err != nil {
@@ -1037,17 +1182,61 @@ func (s *CPASyncService) switchMihomo(ctx context.Context, settings *cpaSyncSett
 		return errors.New("selector has no candidate nodes")
 	}
 
-	next := detail.All[0]
-	if len(detail.All) > 1 {
-		for idx, candidate := range detail.All {
-			if candidate == detail.Now {
-				next = detail.All[(idx+1)%len(detail.All)]
-				break
-			}
+	candidates := buildMihomoSwitchCandidates(detail)
+	var lastErr error
+	for _, candidate := range candidates {
+		if err := s.setMihomoSelector(ctx, settings, candidate); err != nil {
+			lastErr = fmt.Errorf("switch to %s failed: %w", candidate, err)
+			continue
 		}
+		if err := s.triggerMihomoDelay(ctx, settings); err != nil {
+			lastErr = fmt.Errorf("candidate %s delay test failed: %w", candidate, err)
+			continue
+		}
+
+		now := time.Now().UTC().Format(time.RFC3339)
+		state.CurrentMihomoNode = candidate
+		state.LastSwitchAt = now
+		state.LastRunAt = now
+		state.LastRunStatus = "switch_success"
+		state.LastRunSummary = fmt.Sprintf("reason=%s, node=%s", reason, candidate)
+		state.LastErrorSummary = ""
+		return nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no Mihomo candidate available")
+	}
+	return lastErr
+}
+
+func buildMihomoSwitchCandidates(detail *mihomoSelectorDetail) []string {
+	if detail == nil || len(detail.All) == 0 {
+		return nil
+	}
+	if len(detail.All) == 1 {
+		return append([]string{}, detail.All...)
 	}
 
-	body, _ := json.Marshal(map[string]string{"name": next})
+	currentIndex := -1
+	for idx, candidate := range detail.All {
+		if candidate == detail.Now {
+			currentIndex = idx
+			break
+		}
+	}
+	if currentIndex < 0 {
+		return append([]string{}, detail.All...)
+	}
+
+	candidates := make([]string, 0, len(detail.All))
+	for offset := 1; offset <= len(detail.All); offset++ {
+		candidates = append(candidates, detail.All[(currentIndex+offset)%len(detail.All)])
+	}
+	return candidates
+}
+
+func (s *CPASyncService) setMihomoSelector(ctx context.Context, settings *cpaSyncSettings, candidate string) error {
+	body, _ := json.Marshal(map[string]string{"name": candidate})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, fmt.Sprintf("%s/proxies/%s", settings.MihomoBaseURL, url.PathEscape(settings.MihomoStrategyGroup)), bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -1061,38 +1250,14 @@ func (s *CPASyncService) switchMihomo(ctx context.Context, settings *cpaSyncSett
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("switch selector failed: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
-
-	state.CurrentMihomoNode = next
-	state.LastRunAt = time.Now().UTC().Format(time.RFC3339)
-	state.LastRunStatus = "switch_success"
-	state.LastRunSummary = fmt.Sprintf("reason=%s, node=%s", reason, next)
-	state.LastErrorSummary = ""
 	return nil
 }
 
 func (s *CPASyncService) triggerMihomoDelay(ctx context.Context, settings *cpaSyncSettings) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/proxies/%s/delay?url=%s&timeout=%d",
-		settings.MihomoBaseURL,
-		url.PathEscape(settings.MihomoStrategyGroup),
-		url.QueryEscape(settings.MihomoDelayTestURL),
-		settings.MihomoDelayTimeout,
-	), nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+settings.MihomoSecret)
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("delay test failed: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	return nil
+	_, err := s.runMihomoDelayTest(ctx, settings)
+	return err
 }
 
 func (s *CPASyncService) getMihomoSelector(ctx context.Context, settings *cpaSyncSettings) (*mihomoSelectorDetail, error) {
@@ -1261,7 +1426,7 @@ func parseCPAAuthFiles(body []byte) ([]cpaAuthFileRecord, error) {
 		record := cpaAuthFileRecord{
 			Name:          firstString(item, "name", "file_name", "filename", "id"),
 			Email:         firstString(item, "email"),
-			StatusMessage: firstString(item, "status_message", "status"),
+			StatusMessage: extractCPAStatusMessage(item),
 			RefreshToken:  firstString(item, "refresh_token"),
 			AccessToken:   firstString(item, "access_token"),
 		}
@@ -1271,6 +1436,28 @@ func parseCPAAuthFiles(body []byte) ([]cpaAuthFileRecord, error) {
 		records = append(records, record)
 	}
 	return records, nil
+}
+
+func extractCPAStatusMessage(item map[string]any) string {
+	if item == nil {
+		return ""
+	}
+	if message := firstString(item, "status_message", "statusMessage", "status", "message"); message != "" {
+		return message
+	}
+	if errorObj := unwrapObject(item["error"]); errorObj != nil {
+		if encoded, err := json.Marshal(map[string]any{"error": errorObj}); err == nil {
+			return string(encoded)
+		}
+	}
+	for _, key := range []string{"details", "meta", "data", "auth_file"} {
+		if nested := unwrapObject(item[key]); nested != nil {
+			if message := extractCPAStatusMessage(nested); message != "" {
+				return message
+			}
+		}
+	}
+	return ""
 }
 
 func parseCPADownloadedAccount(body []byte) (*cpaDownloadedAccount, error) {

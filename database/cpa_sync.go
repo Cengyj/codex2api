@@ -28,6 +28,7 @@ type CPASyncState struct {
 	HourBucketStart        string               `json:"hour_bucket_start"`
 	HourlyUploadCount      int                  `json:"hourly_upload_count"`
 	ConsecutiveUploadCount int                  `json:"consecutive_upload_count"`
+	LastSwitchAt           string               `json:"last_switch_at"`
 	LastRunAt              string               `json:"last_run_at"`
 	LastRunStatus          string               `json:"last_run_status"`
 	LastRunSummary         string               `json:"last_run_summary"`
@@ -48,6 +49,7 @@ func (db *DB) GetCPASyncState(ctx context.Context) (*CPASyncState, error) {
 
 	var (
 		hourBucketRaw        interface{}
+		lastSwitchAtRaw      interface{}
 		lastRunRaw           interface{}
 		recentActions        string
 		cpaTestOK            sql.NullBool
@@ -61,7 +63,7 @@ func (db *DB) GetCPASyncState(ctx context.Context) (*CPASyncState, error) {
 	)
 	err := db.conn.QueryRowContext(ctx, `
 		SELECT hour_bucket_start, COALESCE(hourly_upload_count, 0), COALESCE(consecutive_upload_count, 0),
-		       last_run_at, COALESCE(last_run_status, ''), COALESCE(last_run_summary, ''),
+		       last_switch_at, last_run_at, COALESCE(last_run_status, ''), COALESCE(last_run_summary, ''),
 		       COALESCE(last_error_summary, ''), COALESCE(current_mihomo_node, ''),
 		       COALESCE(last_cpa_account_count, 0), COALESCE(recent_actions, '[]'),
 		       cpa_test_ok, COALESCE(cpa_test_message, ''), cpa_test_http_status, cpa_tested_at, COALESCE(cpa_test_details, '{}'),
@@ -72,6 +74,7 @@ func (db *DB) GetCPASyncState(ctx context.Context) (*CPASyncState, error) {
 		&hourBucketRaw,
 		&state.HourlyUploadCount,
 		&state.ConsecutiveUploadCount,
+		&lastSwitchAtRaw,
 		&lastRunRaw,
 		&state.LastRunStatus,
 		&state.LastRunSummary,
@@ -99,6 +102,9 @@ func (db *DB) GetCPASyncState(ctx context.Context) (*CPASyncState, error) {
 
 	if parsed, err := parseNullableDBTime(hourBucketRaw); err == nil {
 		state.HourBucketStart = parsed
+	}
+	if parsed, err := parseNullableDBTime(lastSwitchAtRaw); err == nil {
+		state.LastSwitchAt = parsed
 	}
 	if parsed, err := parseNullableDBTime(lastRunRaw); err == nil {
 		state.LastRunAt = parsed
@@ -157,16 +163,17 @@ func (db *DB) UpdateCPASyncState(ctx context.Context, state *CPASyncState) error
 	_, err = db.conn.ExecContext(ctx, `
 		INSERT INTO cpa_sync_state (
 			id, hour_bucket_start, hourly_upload_count, consecutive_upload_count,
-			last_run_at, last_run_status, last_run_summary, last_error_summary,
+			last_switch_at, last_run_at, last_run_status, last_run_summary, last_error_summary,
 			current_mihomo_node, last_cpa_account_count, recent_actions,
 			cpa_test_ok, cpa_test_message, cpa_test_http_status, cpa_tested_at, cpa_test_details,
 			mihomo_test_ok, mihomo_test_message, mihomo_test_http_status, mihomo_tested_at, mihomo_test_details
 		)
-		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		ON CONFLICT (id) DO UPDATE SET
 			hour_bucket_start = EXCLUDED.hour_bucket_start,
 			hourly_upload_count = EXCLUDED.hourly_upload_count,
 			consecutive_upload_count = EXCLUDED.consecutive_upload_count,
+			last_switch_at = EXCLUDED.last_switch_at,
 			last_run_at = EXCLUDED.last_run_at,
 			last_run_status = EXCLUDED.last_run_status,
 			last_run_summary = EXCLUDED.last_run_summary,
@@ -185,10 +192,46 @@ func (db *DB) UpdateCPASyncState(ctx context.Context, state *CPASyncState) error
 			mihomo_tested_at = EXCLUDED.mihomo_tested_at,
 			mihomo_test_details = EXCLUDED.mihomo_test_details
 	`, nullableRFC3339(state.HourBucketStart), state.HourlyUploadCount, state.ConsecutiveUploadCount,
-		nullableRFC3339(state.LastRunAt), state.LastRunStatus, state.LastRunSummary, state.LastErrorSummary,
+		nullableRFC3339(state.LastSwitchAt), nullableRFC3339(state.LastRunAt), state.LastRunStatus, state.LastRunSummary, state.LastErrorSummary,
 		state.CurrentMihomoNode, state.LastCPAAccountCount, string(actionsJSON),
 		nullableBoolValue(state.CPATestStatus.Ok), state.CPATestStatus.Message, nullableIntValue(state.CPATestStatus.HTTPStatus), nullableRFC3339(state.CPATestStatus.TestedAt), string(cpaTestDetailsJSON),
 		nullableBoolValue(state.MihomoTestStatus.Ok), state.MihomoTestStatus.Message, nullableIntValue(state.MihomoTestStatus.HTTPStatus), nullableRFC3339(state.MihomoTestStatus.TestedAt), string(mihomoTestDetailsJSON))
+	return err
+}
+
+func (db *DB) UpdateCPASyncCPATestStatus(ctx context.Context, status ConnectionTestStatus) error {
+	detailsJSON, err := json.Marshal(normalizeConnectionTestDetails(status.Details))
+	if err != nil {
+		return err
+	}
+	_, err = db.conn.ExecContext(ctx, `
+		INSERT INTO cpa_sync_state (id, recent_actions, cpa_test_ok, cpa_test_message, cpa_test_http_status, cpa_tested_at, cpa_test_details)
+		VALUES (1, '[]', $1, $2, $3, $4, $5)
+		ON CONFLICT (id) DO UPDATE SET
+			cpa_test_ok = EXCLUDED.cpa_test_ok,
+			cpa_test_message = EXCLUDED.cpa_test_message,
+			cpa_test_http_status = EXCLUDED.cpa_test_http_status,
+			cpa_tested_at = EXCLUDED.cpa_tested_at,
+			cpa_test_details = EXCLUDED.cpa_test_details
+	`, nullableBoolValue(status.Ok), status.Message, nullableIntValue(status.HTTPStatus), nullableRFC3339(status.TestedAt), string(detailsJSON))
+	return err
+}
+
+func (db *DB) UpdateCPASyncMihomoTestStatus(ctx context.Context, status ConnectionTestStatus) error {
+	detailsJSON, err := json.Marshal(normalizeConnectionTestDetails(status.Details))
+	if err != nil {
+		return err
+	}
+	_, err = db.conn.ExecContext(ctx, `
+		INSERT INTO cpa_sync_state (id, recent_actions, mihomo_test_ok, mihomo_test_message, mihomo_test_http_status, mihomo_tested_at, mihomo_test_details)
+		VALUES (1, '[]', $1, $2, $3, $4, $5)
+		ON CONFLICT (id) DO UPDATE SET
+			mihomo_test_ok = EXCLUDED.mihomo_test_ok,
+			mihomo_test_message = EXCLUDED.mihomo_test_message,
+			mihomo_test_http_status = EXCLUDED.mihomo_test_http_status,
+			mihomo_tested_at = EXCLUDED.mihomo_tested_at,
+			mihomo_test_details = EXCLUDED.mihomo_test_details
+	`, nullableBoolValue(status.Ok), status.Message, nullableIntValue(status.HTTPStatus), nullableRFC3339(status.TestedAt), string(detailsJSON))
 	return err
 }
 
