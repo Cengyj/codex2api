@@ -801,6 +801,159 @@ func TestRunOnceFallsBackToPostDeleteCountWhenCPARefreshFails(t *testing.T) {
 	}
 }
 
+func TestRunOnceKeepsUnknownCPAErrorsButStillUploadsWhenHealthyCountIsLow(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		records = []map[string]any{
+			{
+				"name":           "proxy-error.json",
+				"email":          "broken@example.com",
+				"status":         "error",
+				"status_message": `Post "https://chatgpt.com/backend-api/codex/responses": proxyconnect tcp: dial tcp 1.2.3.4:443: connect: connection refused`,
+				"disabled":       false,
+				"unavailable":    false,
+			},
+		}
+		uploadedNames []string
+		deletedNames  []string
+	)
+
+	handler := http.NewServeMux()
+	handler.HandleFunc("/v0/management/auth-files", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch r.Method {
+		case http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": records})
+		case http.MethodDelete:
+			name := strings.TrimSpace(r.URL.Query().Get("name"))
+			if name == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			deletedNames = append(deletedNames, name)
+			filtered := make([]map[string]any, 0, len(records))
+			for _, record := range records {
+				if strings.TrimSpace(firstString(record, "name")) == name {
+					continue
+				}
+				filtered = append(filtered, record)
+			}
+			records = filtered
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPost:
+			var entry cpaExportEntry
+			if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			name := strings.TrimSpace(r.URL.Query().Get("name"))
+			if name == "" {
+				name = buildCPAAuthFileName(entry)
+			}
+			uploadedNames = append(uploadedNames, name)
+			records = append(records, map[string]any{
+				"name":           name,
+				"email":          entry.Email,
+				"status":         "active",
+				"status_message": "",
+				"disabled":       false,
+				"unavailable":    false,
+			})
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+	handler.HandleFunc("/v0/management/auth-files/upload", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	service, db, store := newCPASyncTestService(t, server.URL)
+	if err := db.UpdateSystemSettings(context.Background(), &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		CPASyncEnabled:         true,
+		CPABaseURL:             server.URL,
+		CPAAdminKey:            "test-key",
+		CPAMinAccounts:         1,
+		CPASyncIntervalSeconds: 300,
+		MihomoDelayTimeoutMs:   5000,
+	}); err != nil {
+		t.Fatalf("UpdateSystemSettings() error: %v", err)
+	}
+
+	accountID, err := db.InsertAccount(context.Background(), "upload@example.com", "rt-upload-healthy", "")
+	if err != nil {
+		t.Fatalf("InsertAccount() error: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), accountID, map[string]interface{}{
+		"email":        "upload@example.com",
+		"account_id":   "acct-upload-healthy",
+		"access_token": "at-upload-healthy",
+	}); err != nil {
+		t.Fatalf("UpdateCredentials() error: %v", err)
+	}
+	store.AddAccount(&auth.Account{
+		DBID:         accountID,
+		RefreshToken: "rt-upload-healthy",
+		AccessToken:  "at-upload-healthy",
+		Email:        "upload@example.com",
+		AccountID:    "acct-upload-healthy",
+	})
+
+	status, err := service.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deletedNames) != 0 {
+		t.Fatalf("deletedNames = %v, want no deletion for unknown CPA error", deletedNames)
+	}
+	if len(uploadedNames) != 1 {
+		t.Fatalf("len(uploadedNames) = %d, want 1 successful upload", len(uploadedNames))
+	}
+	if status.State.LastCPAAccountCount != 1 {
+		t.Fatalf("LastCPAAccountCount = %d, want 1 healthy CPA account after upload", status.State.LastCPAAccountCount)
+	}
+	if !strings.Contains(status.State.LastRunSummary, "processed_errors=0") {
+		t.Fatalf("LastRunSummary = %q, want processed_errors=0 for unknown error", status.State.LastRunSummary)
+	}
+	if !strings.Contains(status.State.LastRunSummary, "uploaded=1") {
+		t.Fatalf("LastRunSummary = %q, want uploaded=1", status.State.LastRunSummary)
+	}
+}
+
+func TestParseCPAAuthFilesMarksDisabledAndUnavailableRecordsIneffective(t *testing.T) {
+	body := []byte(`{"files":[
+		{"name":"disabled.json","email":"disabled@example.com","status":"active","disabled":true},
+		{"name":"unavailable.json","email":"unavailable@example.com","status":"active","unavailable":true},
+		{"name":"healthy.json","email":"healthy@example.com","status":"active"}
+	]}`)
+
+	records, err := parseCPAAuthFiles(body)
+	if err != nil {
+		t.Fatalf("parseCPAAuthFiles() error: %v", err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("len(records) = %d, want 3", len(records))
+	}
+
+	effective := filterEffectiveCPAAuthFileRecords(records)
+	if len(effective) != 1 {
+		t.Fatalf("len(effective) = %d, want 1", len(effective))
+	}
+	if effective[0].Name != "healthy.json" {
+		t.Fatalf("effective[0].Name = %q, want %q", effective[0].Name, "healthy.json")
+	}
+}
+
 func TestSwitchMihomoUsesDefaultDelayURLWhenUnset(t *testing.T) {
 	var (
 		mu          sync.Mutex
@@ -877,5 +1030,48 @@ func TestSwitchMihomoUsesDefaultDelayURLWhenUnset(t *testing.T) {
 	}
 	if lastTestURL != defaultMihomoDelayTestURL {
 		t.Fatalf("delay test url = %q, want %q", lastTestURL, defaultMihomoDelayTestURL)
+	}
+}
+
+func TestTestMihomoPersistsCurrentNodeToSyncState(t *testing.T) {
+	mihomoServer, currentNode := newMihomoTestServer(t, "node-b", []string{"node-a", "node-b", "node-c"}, nil)
+	defer mihomoServer.Close()
+
+	service, db, _ := newCPASyncTestService(t, "http://example.invalid")
+	if err := db.UpdateSystemSettings(context.Background(), &database.SystemSettings{
+		MaxConcurrency:       2,
+		TestConcurrency:      1,
+		TestModel:            "gpt-5.4",
+		CPASyncEnabled:       true,
+		CPABaseURL:           "http://example.invalid",
+		CPAAdminKey:          "test-key",
+		MihomoBaseURL:        mihomoServer.URL,
+		MihomoSecret:         "mihomo-secret",
+		MihomoStrategyGroup:  "Selector",
+		MihomoDelayTimeoutMs: 5000,
+	}); err != nil {
+		t.Fatalf("UpdateSystemSettings() error: %v", err)
+	}
+
+	result, err := service.TestMihomo(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("TestMihomo() error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("TestMihomo() returned nil result")
+	}
+	if got := strings.TrimSpace(firstString(result.Details, "current_node")); got != *currentNode {
+		t.Fatalf("current_node detail = %q, want %q", got, *currentNode)
+	}
+
+	state, err := db.GetCPASyncState(context.Background())
+	if err != nil {
+		t.Fatalf("GetCPASyncState() error: %v", err)
+	}
+	if state.CurrentMihomoNode != *currentNode {
+		t.Fatalf("CurrentMihomoNode = %q, want %q", state.CurrentMihomoNode, *currentNode)
+	}
+	if state.MihomoTestStatus.TestedAt == "" {
+		t.Fatal("MihomoTestStatus.TestedAt is empty, want persisted test status")
 	}
 }

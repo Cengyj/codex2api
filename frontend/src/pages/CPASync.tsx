@@ -204,6 +204,13 @@ function normalizeTestStatus(status?: ConnectionTestStatus | null): ConnectionTe
   }
 }
 
+function getStringDetail(status: ConnectionTestStatus | null | undefined, key: string): string {
+  const value = status?.details?.[key]
+  if (typeof value === 'string') return value.trim()
+  if (typeof value === 'number') return String(value)
+  return ''
+}
+
 function getCPAConfigMissing(settings: Partial<SystemSettings> | null | undefined): string[] {
   if (!settings) return ['cpa_base_url', 'cpa_admin_key']
   const missing: string[] = []
@@ -598,12 +605,27 @@ export default function CPASync() {
   const mihomoBaseValue = form?.mihomo_base_url?.trim() ?? ''
   const mihomoSecretValue = form?.mihomo_secret?.trim() ?? ''
   const recentActions = [...(status?.state.recent_actions ?? [])].reverse()
+  const runtimeBusy = Boolean(status?.running || running || switching || testingCPA || testingMihomo)
+  const runtimeStatusLabel = testingCPA || testingMihomo
+    ? t('cpaSync.testing')
+    : runtimeBusy
+      ? t('cpaSync.runningTask')
+      : t('cpaSync.idleTask')
+  const runtimeStatusDescription = testingCPA || testingMihomo
+    ? t('cpaSync.connectionActionsDesc')
+    : runtimeBusy
+      ? t('cpaSync.workerBusyDesc')
+      : t('cpaSync.workerIdleDesc')
+  const selectedMihomoGroup = mihomoGroups.find((group) => group.name === form?.mihomo_strategy_group)
+  const currentNodeFromService = selectedMihomoGroup?.current?.trim() ?? ''
+  const currentNodeFromTest = getStringDetail(localMihomoTestStatus, 'current_node') || getStringDetail(mihomoTestStatus, 'current_node')
+  const displayedCurrentMihomoNode = status?.state.current_mihomo_node?.trim() || currentNodeFromService || currentNodeFromTest || '--'
   const shouldAutoProbeMihomoService = Boolean(mihomoBaseValue && mihomoSecretValue) && lastMihomoFetchKey !== mihomoServiceSettingsSignature
   const syncIntervalSeconds = status?.config.interval_seconds ?? form?.cpa_sync_interval_seconds ?? 300
-  const nextRunCountdown = formatNextRunCountdown(status?.next_run_at, nowMs, Boolean(form?.cpa_sync_enabled), Boolean(status?.running), t)
+  const nextRunCountdown = formatNextRunCountdown(status?.next_run_at, nowMs, Boolean(form?.cpa_sync_enabled), runtimeBusy, t)
   const nextRunDetail = !form?.cpa_sync_enabled
     ? t('cpaSync.nextRunDisabledDesc')
-    : status?.running
+    : runtimeBusy
       ? t('cpaSync.nextRunRunningDesc')
       : status?.next_run_at
         ? `${formatAbsoluteTime(status.next_run_at)} · ${t('cpaSync.syncEverySeconds', { count: syncIntervalSeconds })}`
@@ -730,6 +752,7 @@ export default function CPASync() {
         mihomo_base_url: sourceForm.mihomo_base_url.trim(),
         mihomo_secret: sourceForm.mihomo_secret.trim(),
       })
+      const selectedGroup = (result.groups ?? []).find((group) => group.name === sourceForm.mihomo_strategy_group)
       setMihomoGroups(result.groups ?? [])
       setMihomoServiceStatus({
         ok: true,
@@ -740,6 +763,13 @@ export default function CPASync() {
           group_count: (result.groups ?? []).length,
         },
       })
+      patchStatus((current) => current ? ({
+        ...current,
+        state: {
+          ...current.state,
+          current_mihomo_node: selectedGroup?.current?.trim() || current.state.current_mihomo_node,
+        },
+      }) : current)
       setTestSignatures((prev) => ({ ...prev, mihomoService: fetchKey }))
       setLastMihomoFetchKey(fetchKey)
       if ((result.groups ?? []).length === 0) {
@@ -854,8 +884,13 @@ export default function CPASync() {
       const result = await api.testCPASyncCPA(pickCPASyncSettings(form))
       setLocalCPATestStatus(result)
       setTestSignatures((prev) => ({ ...prev, cpa: cpaSettingsSignature }))
+      patchStatus((current) => current ? ({
+        ...current,
+        cpa_test_status: result,
+      }) : current)
       const message = localizeConnectionMessage(result.message, t)
       showToast(result.ok ? message || t('cpaSync.cpaTestSuccess') : message || t('cpaSync.cpaTestFailed'), result.ok ? 'success' : 'error')
+      void refreshStatus()
     } catch (err) {
       showToast(`${t('cpaSync.cpaTestFailed')}: ${getErrorMessage(err)}`, 'error')
     } finally {
@@ -870,8 +905,21 @@ export default function CPASync() {
       const result = await api.testCPASyncMihomo(pickCPASyncSettings(form))
       setLocalMihomoTestStatus(result)
       setTestSignatures((prev) => ({ ...prev, mihomo: mihomoSettingsSignature }))
+      patchStatus((current) => {
+        if (!current) return current
+        const nextNode = getStringDetail(result, 'current_node')
+        return {
+          ...current,
+          mihomo_test_status: result,
+          state: {
+            ...current.state,
+            current_mihomo_node: nextNode || current.state.current_mihomo_node,
+          },
+        }
+      })
       const message = localizeConnectionMessage(result.message, t)
       showToast(result.ok ? message || t('cpaSync.mihomoTestSuccess') : message || t('cpaSync.mihomoTestFailed'), result.ok ? 'success' : 'error')
+      void refreshStatus()
     } catch (err) {
       showToast(`${t('cpaSync.mihomoTestFailed')}: ${getErrorMessage(err)}`, 'error')
     } finally {
@@ -919,12 +967,12 @@ export default function CPASync() {
               <OverviewCard
                 icon={<Wrench className="size-5" />}
                 label={t('cpaSync.workerStatus')}
-                value={status?.running ? t('cpaSync.runningTask') : t('cpaSync.idleTask')}
-                sub={status?.running ? t('cpaSync.workerBusyDesc') : t('cpaSync.workerIdleDesc')}
+                value={runtimeStatusLabel}
+                sub={runtimeStatusDescription}
                 badge={
-                  <Badge className={status?.running ? infoBadgeClassName : mutedBadgeClassName}>
-                    <span className={`size-1.5 rounded-full ${status?.running ? 'bg-blue-500' : 'bg-gray-400'}`} />
-                    {status?.running ? t('common.running') : t('cpaSync.idle')}
+                  <Badge className={runtimeBusy ? infoBadgeClassName : mutedBadgeClassName}>
+                    <span className={`size-1.5 rounded-full ${runtimeBusy ? 'bg-blue-500' : 'bg-gray-400'}`} />
+                    {runtimeBusy ? t('common.running') : t('cpaSync.idle')}
                   </Badge>
                 }
               />
@@ -948,8 +996,8 @@ export default function CPASync() {
                 value={nextRunCountdown}
                 sub={nextRunDetail}
                 badge={
-                  <Badge className={status?.running ? infoBadgeClassName : (form.cpa_sync_enabled ? mutedBadgeClassName : warningBadgeClassName)}>
-                    <span className={`size-1.5 rounded-full ${status?.running ? 'bg-blue-500' : (form.cpa_sync_enabled ? 'bg-gray-400' : 'bg-amber-500')}`} />
+                  <Badge className={runtimeBusy ? infoBadgeClassName : (form.cpa_sync_enabled ? mutedBadgeClassName : warningBadgeClassName)}>
+                    <span className={`size-1.5 rounded-full ${runtimeBusy ? 'bg-blue-500' : (form.cpa_sync_enabled ? 'bg-gray-400' : 'bg-amber-500')}`} />
                     {t('cpaSync.syncEverySeconds', { count: syncIntervalSeconds })}
                   </Badge>
                 }
@@ -964,7 +1012,7 @@ export default function CPASync() {
               <OverviewCard
                 icon={<Database className="size-5" />}
                 label={t('cpaSync.currentNode')}
-                value={status?.state.current_mihomo_node || '--'}
+                value={displayedCurrentMihomoNode}
                 sub={t('cpaSync.currentNodeDesc')}
                 badge={
                   <Badge className={mutedBadgeClassName}>
@@ -1021,8 +1069,8 @@ export default function CPASync() {
                     <StatusTile label={t('cpaSync.cpaCount')} value={String(status?.state.last_cpa_account_count ?? 0)} tone="neutral" />
                     <StatusTile label={t('cpaSync.hourlyUploads')} value={String(status?.state.hourly_upload_count ?? 0)} tone="success" />
                     <StatusTile label={t('cpaSync.lastSwitchAt')} value={status?.state.last_switch_at ? formatRelativeTime(status.state.last_switch_at, { variant: 'compact' }) : '--'} tone="info" />
-                    <StatusTile label={t('cpaSync.currentNode')} value={status?.state.current_mihomo_node || '--'} tone="warning" />
-                    <StatusTile label={t('cpaSync.nextRunAt')} value={nextRunCountdown} tone={status?.running ? 'info' : 'neutral'} />
+                    <StatusTile label={t('cpaSync.currentNode')} value={displayedCurrentMihomoNode} tone="warning" />
+                    <StatusTile label={t('cpaSync.nextRunAt')} value={nextRunCountdown} tone={runtimeBusy ? 'info' : 'neutral'} />
                   </div>
 
                   <div className="rounded-3xl border border-border bg-white/70 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.75)] dark:bg-white/5 dark:shadow-none">

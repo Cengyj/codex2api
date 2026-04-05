@@ -92,6 +92,8 @@ type cpaAuthFileRecord struct {
 	StatusMessage string
 	RefreshToken  string
 	AccessToken   string
+	Disabled      bool
+	Unavailable   bool
 }
 
 type cpaDownloadedAccount struct {
@@ -326,7 +328,15 @@ func (s *CPASyncService) TestMihomo(ctx context.Context, req *cpaSyncConnectionT
 	}
 	result := s.runMihomoConnectionTest(ctx, settings)
 	normalized := normalizeConnectionTestStatus(result)
-	if err := s.db.UpdateCPASyncMihomoTestStatus(ctx, normalized); err != nil {
+	state, err := s.db.GetCPASyncState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	state.MihomoTestStatus = normalized
+	if currentNode := strings.TrimSpace(firstString(normalized.Details, "current_node")); currentNode != "" {
+		state.CurrentMihomoNode = currentNode
+	}
+	if err := s.db.UpdateCPASyncState(ctx, state); err != nil {
 		return nil, err
 	}
 	return &normalized, nil
@@ -471,7 +481,8 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 			}
 		}
 	}
-	state.LastCPAAccountCount = len(records)
+	effectiveRecords := filterEffectiveCPAAuthFileRecords(records)
+	state.LastCPAAccountCount = len(effectiveRecords)
 
 	targetCount := settings.MinAccounts
 	if settings.MaxAccounts > 0 && (targetCount == 0 || settings.MaxAccounts < targetCount) {
@@ -496,7 +507,7 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 			}
 		}
 		if remaining > 0 {
-			candidates, err := s.selectUploadCandidates(ctx, records, downloadedTokens, remaining)
+			candidates, err := s.selectUploadCandidates(ctx, effectiveRecords, downloadedTokens, remaining)
 			if err != nil {
 				s.recordAction(state, "upload", "error", fmt.Sprintf("select candidates failed: %v", err), "")
 				if firstErrorSummary == "" {
@@ -1439,6 +1450,8 @@ func parseCPAAuthFiles(body []byte) ([]cpaAuthFileRecord, error) {
 			StatusMessage: extractCPAStatusMessage(item),
 			RefreshToken:  firstString(item, "refresh_token"),
 			AccessToken:   firstString(item, "access_token"),
+			Disabled:      boolFromAny(item["disabled"]),
+			Unavailable:   boolFromAny(item["unavailable"]),
 		}
 		if record.Name == "" && record.Email == "" {
 			continue
@@ -1552,6 +1565,35 @@ func parseCPAUsageLimitResetAt(statusMessage string, now time.Time) (time.Time, 
 	return time.Time{}, false
 }
 
+func boolFromAny(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			return true
+		default:
+			return false
+		}
+	case int:
+		return v != 0
+	case int32:
+		return v != 0
+	case int64:
+		return v != 0
+	case float32:
+		return v != 0
+	case float64:
+		return v != 0
+	case json.Number:
+		parsed, err := v.Int64()
+		return err == nil && parsed != 0
+	default:
+		return false
+	}
+}
+
 func int64FromAny(value any) (int64, bool) {
 	switch v := value.(type) {
 	case int:
@@ -1573,6 +1615,28 @@ func int64FromAny(value any) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func filterEffectiveCPAAuthFileRecords(records []cpaAuthFileRecord) []cpaAuthFileRecord {
+	effective := make([]cpaAuthFileRecord, 0, len(records))
+	for _, record := range records {
+		if !isEffectiveCPAAuthFileRecord(record) {
+			continue
+		}
+		effective = append(effective, record)
+	}
+	return effective
+}
+
+func isEffectiveCPAAuthFileRecord(record cpaAuthFileRecord) bool {
+	if record.Disabled || record.Unavailable {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(record.Status)) {
+	case "error", "failed", "failure", "invalid", "disabled", "unavailable":
+		return false
+	}
+	return detectCPAErrorKind(record.StatusMessage) == ""
 }
 
 func matchLocalAccount(rows []*database.AccountRow, remote *cpaDownloadedAccount) (*database.AccountRow, string) {
