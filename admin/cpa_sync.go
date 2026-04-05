@@ -88,6 +88,7 @@ type cpaSyncStatusResponse struct {
 type cpaAuthFileRecord struct {
 	Name          string
 	Email         string
+	Status        string
 	StatusMessage string
 	RefreshToken  string
 	AccessToken   string
@@ -424,12 +425,12 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 						s.recordAction(state, "reconcile", "success", fmt.Sprintf("updated local credentials via %s", matchKind), record.Name)
 					}
 				}
-				if kind == "account_deactivated" {
+				if kind == "account_deactivated" || kind == "token_invalidated" {
 					s.markUnauthorized(matched.ID)
 				} else if kind == "usage_limit_reached" {
 					s.markRateLimited(matched.ID, record.StatusMessage)
 				}
-			} else if kind != "account_deactivated" && localAccountCandidateCount(localRows, remote) == 0 {
+			} else if kind != "account_deactivated" && kind != "token_invalidated" && kind != "proxy_runtime_error" && localAccountCandidateCount(localRows, remote) == 0 {
 				importedID, importName, err := s.importRemoteAccount(ctx, remote)
 				if err != nil {
 					s.recordAction(state, "reconcile", "error", fmt.Sprintf("create local account failed: %v", err), record.Name)
@@ -1426,6 +1427,7 @@ func parseCPAAuthFiles(body []byte) ([]cpaAuthFileRecord, error) {
 		record := cpaAuthFileRecord{
 			Name:          firstString(item, "name", "file_name", "filename", "id"),
 			Email:         firstString(item, "email"),
+			Status:        firstString(item, "status"),
 			StatusMessage: extractCPAStatusMessage(item),
 			RefreshToken:  firstString(item, "refresh_token"),
 			AccessToken:   firstString(item, "access_token"),
@@ -1501,6 +1503,9 @@ func detectCPAErrorKind(statusMessage string) string {
 		if firstString(errorObj, "code") == "account_deactivated" {
 			return "account_deactivated"
 		}
+		if firstString(errorObj, "code") == "token_invalidated" {
+			return "token_invalidated"
+		}
 	}
 	lower := strings.ToLower(statusMessage)
 	switch {
@@ -1508,6 +1513,14 @@ func detectCPAErrorKind(statusMessage string) string {
 		return "usage_limit_reached"
 	case strings.Contains(lower, "account_deactivated"):
 		return "account_deactivated"
+	case strings.Contains(lower, "token_invalidated"),
+		strings.Contains(lower, "authentication token has been invalidated"),
+		strings.Contains(lower, "signing in again"):
+		return "token_invalidated"
+	case strings.Contains(lower, "proxyconnect tcp:"),
+		strings.Contains(lower, "connect: connection refused"),
+		strings.Contains(lower, "dial tcp"):
+		return "proxy_runtime_error"
 	default:
 		return ""
 	}
