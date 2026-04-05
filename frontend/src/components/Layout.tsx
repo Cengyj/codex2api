@@ -138,7 +138,18 @@ export default function Layout({ children }: PropsWithChildren) {
           <header className="hidden max-lg:flex items-center justify-between gap-4 mb-4 p-3.5 border border-border rounded-[22px] bg-white/70 dark:bg-[hsl(220_13%_15%/0.7)]">
             <div className="flex items-center gap-3">
               <img src={logoImg} alt="CodexProxy" className="w-8 h-8 rounded-[10px] object-cover" />
-              <strong className="text-lg">CodexProxy</strong>
+              <div className="flex flex-col gap-0.5">
+                <strong className="text-lg leading-none">CodexProxy</strong>
+                <span
+                  className="inline-flex items-center px-2 py-0.5 rounded-full bg-primary/10 text-primary text-[10px] font-bold w-fit"
+                  title={hasUpdate && latestVersion ? t('common.newVersionAvailable', { version: latestVersion }) : undefined}
+                >
+                  {__APP_VERSION__}
+                  {hasUpdate && (
+                    <span className="ml-1 size-1.5 rounded-full bg-red-500 animate-pulse" />
+                  )}
+                </span>
+              </div>
             </div>
             <div className="flex items-center gap-2">
               <button

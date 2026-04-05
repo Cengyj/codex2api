@@ -326,8 +326,11 @@ deploy() {
   info "开始部署..."
 
   if [[ "$BUILD_MODE" == "local" ]]; then
+    local build_version
+    build_version=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+    info "本次构建版本: $build_version"
     info "本地构建并启动..."
-    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d --build
+    BUILD_VERSION="$build_version" $COMPOSE_CMD -f "$COMPOSE_FILE" up -d --build
   else
     info "拉取最新镜像..."
     $COMPOSE_CMD -f "$COMPOSE_FILE" pull

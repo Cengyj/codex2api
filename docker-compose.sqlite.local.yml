@@ -2,7 +2,10 @@ name: codex2api-sqlite-local
 
 services:
   codex2api:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     container_name: codex2api-sqlite-local
     ports:
       - "${CODEX_PORT:-8080}:${CODEX_PORT:-8080}"
