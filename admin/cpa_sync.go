@@ -315,7 +315,15 @@ func (s *CPASyncService) TestCPA(ctx context.Context, req *cpaSyncConnectionTest
 	}
 	result := s.runCPAConnectionTest(ctx, settings)
 	normalized := normalizeConnectionTestStatus(result)
-	if err := s.db.UpdateCPASyncCPATestStatus(ctx, normalized); err != nil {
+	state, err := s.db.GetCPASyncState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	state.CPATestStatus = normalized
+	if accountCount, ok := int64FromAny(normalized.Details["account_count"]); ok && accountCount >= 0 {
+		state.LastCPAAccountCount = int(accountCount)
+	}
+	if err := s.db.UpdateCPASyncState(ctx, state); err != nil {
 		return nil, err
 	}
 	return &normalized, nil

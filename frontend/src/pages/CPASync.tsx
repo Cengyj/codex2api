@@ -211,6 +211,16 @@ function getStringDetail(status: ConnectionTestStatus | null | undefined, key: s
   return ''
 }
 
+function getNumberDetail(status: ConnectionTestStatus | null | undefined, key: string): number | null {
+  const value = status?.details?.[key]
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return null
+}
+
 function getCPAConfigMissing(settings: Partial<SystemSettings> | null | undefined): string[] {
   if (!settings) return ['cpa_base_url', 'cpa_admin_key']
   const missing: string[] = []
@@ -887,6 +897,10 @@ export default function CPASync() {
       patchStatus((current) => current ? ({
         ...current,
         cpa_test_status: result,
+        state: {
+          ...current.state,
+          last_cpa_account_count: getNumberDetail(result, 'account_count') ?? current.state.last_cpa_account_count,
+        },
       }) : current)
       const message = localizeConnectionMessage(result.message, t)
       showToast(result.ok ? message || t('cpaSync.cpaTestSuccess') : message || t('cpaSync.cpaTestFailed'), result.ok ? 'success' : 'error')

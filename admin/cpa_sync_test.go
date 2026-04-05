@@ -1075,3 +1075,44 @@ func TestTestMihomoPersistsCurrentNodeToSyncState(t *testing.T) {
 		t.Fatal("MihomoTestStatus.TestedAt is empty, want persisted test status")
 	}
 }
+
+func TestTestCPAPersistsAccountCountToSyncState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v0/management/auth-files" || r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"files": []map[string]any{
+				{"name": "a.json", "email": "a@example.com", "status": "active"},
+				{"name": "b.json", "email": "b@example.com", "status": "active"},
+				{"name": "c.json", "email": "c@example.com", "status": "active"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	service, db, _ := newCPASyncTestService(t, server.URL)
+
+	result, err := service.TestCPA(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("TestCPA() error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("TestCPA() returned nil result")
+	}
+	if got, ok := int64FromAny(result.Details["account_count"]); !ok || got != 3 {
+		t.Fatalf("account_count detail = %v, ok=%t, want 3,true", result.Details["account_count"], ok)
+	}
+
+	state, err := db.GetCPASyncState(context.Background())
+	if err != nil {
+		t.Fatalf("GetCPASyncState() error: %v", err)
+	}
+	if state.LastCPAAccountCount != 3 {
+		t.Fatalf("LastCPAAccountCount = %d, want 3", state.LastCPAAccountCount)
+	}
+	if state.CPATestStatus.TestedAt == "" {
+		t.Fatal("CPATestStatus.TestedAt is empty, want persisted test status")
+	}
+}
