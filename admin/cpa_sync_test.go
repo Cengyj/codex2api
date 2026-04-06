@@ -796,27 +796,29 @@ func TestRunOnceFallsBackToPostDeleteCountWhenCPARefreshFails(t *testing.T) {
 	if status.State.LastRunStatus != "partial_success" {
 		t.Fatalf("LastRunStatus = %q, want %q", status.State.LastRunStatus, "partial_success")
 	}
-	if !strings.Contains(status.State.LastErrorSummary, "refresh CPA auth files after cleanup failed") {
-		t.Fatalf("LastErrorSummary = %q, want refresh failure summary", status.State.LastErrorSummary)
+	if !strings.Contains(status.State.LastErrorSummary, "final CPA auth file recount failed") {
+		t.Fatalf("LastErrorSummary = %q, want final recount failure summary", status.State.LastErrorSummary)
 	}
 }
 
-func TestRunOnceKeepsUnknownCPAErrorsButStillUploadsWhenHealthyCountIsLow(t *testing.T) {
+func TestRunOnceCountsUnknownCPAErrorsWithoutUploadingWhenMinimumAlreadyMet(t *testing.T) {
 	var (
-		mu      sync.Mutex
-		records = []map[string]any{
-			{
-				"name":           "proxy-error.json",
-				"email":          "broken@example.com",
-				"status":         "error",
-				"status_message": `Post "https://chatgpt.com/backend-api/codex/responses": proxyconnect tcp: dial tcp 1.2.3.4:443: connect: connection refused`,
-				"disabled":       false,
-				"unavailable":    false,
-			},
-		}
+		mu            sync.Mutex
+		listCalls     int
+		records       []map[string]any
 		uploadedNames []string
 		deletedNames  []string
 	)
+	for i := 0; i < 25; i++ {
+		records = append(records, map[string]any{
+			"name":           "proxy-error-" + strings.TrimSpace(time.Unix(int64(i), 0).UTC().Format("150405")) + ".json",
+			"email":          "broken-" + strings.TrimSpace(time.Unix(int64(i), 0).UTC().Format("150405")) + "@example.com",
+			"status":         "error",
+			"status_message": `Post "https://chatgpt.com/backend-api/codex/responses": proxyconnect tcp: dial tcp 1.2.3.4:443: connect: connection refused`,
+			"disabled":       false,
+			"unavailable":    false,
+		})
+	}
 
 	handler := http.NewServeMux()
 	handler.HandleFunc("/v0/management/auth-files", func(w http.ResponseWriter, r *http.Request) {
@@ -825,6 +827,7 @@ func TestRunOnceKeepsUnknownCPAErrorsButStillUploadsWhenHealthyCountIsLow(t *tes
 
 		switch r.Method {
 		case http.MethodGet:
+			listCalls++
 			_ = json.NewEncoder(w).Encode(map[string]any{"files": records})
 		case http.MethodDelete:
 			name := strings.TrimSpace(r.URL.Query().Get("name"))
@@ -880,7 +883,7 @@ func TestRunOnceKeepsUnknownCPAErrorsButStillUploadsWhenHealthyCountIsLow(t *tes
 		CPASyncEnabled:         true,
 		CPABaseURL:             server.URL,
 		CPAAdminKey:            "test-key",
-		CPAMinAccounts:         1,
+		CPAMinAccounts:         25,
 		CPASyncIntervalSeconds: 300,
 		MihomoDelayTimeoutMs:   5000,
 	}); err != nil {
@@ -916,17 +919,307 @@ func TestRunOnceKeepsUnknownCPAErrorsButStillUploadsWhenHealthyCountIsLow(t *tes
 	if len(deletedNames) != 0 {
 		t.Fatalf("deletedNames = %v, want no deletion for unknown CPA error", deletedNames)
 	}
-	if len(uploadedNames) != 1 {
-		t.Fatalf("len(uploadedNames) = %d, want 1 successful upload", len(uploadedNames))
+	if len(uploadedNames) != 0 {
+		t.Fatalf("len(uploadedNames) = %d, want 0 successful uploads when 25 unknown errors already count", len(uploadedNames))
 	}
-	if status.State.LastCPAAccountCount != 1 {
-		t.Fatalf("LastCPAAccountCount = %d, want 1 healthy CPA account after upload", status.State.LastCPAAccountCount)
+	if listCalls != 1 {
+		t.Fatalf("listCalls = %d, want 1 when no remote changes occur", listCalls)
+	}
+	if status.State.LastCPAAccountCount != 25 {
+		t.Fatalf("LastCPAAccountCount = %d, want 25 unknown CPA errors counted as existing accounts", status.State.LastCPAAccountCount)
 	}
 	if !strings.Contains(status.State.LastRunSummary, "processed_errors=0") {
 		t.Fatalf("LastRunSummary = %q, want processed_errors=0 for unknown error", status.State.LastRunSummary)
 	}
-	if !strings.Contains(status.State.LastRunSummary, "uploaded=1") {
-		t.Fatalf("LastRunSummary = %q, want uploaded=1", status.State.LastRunSummary)
+	if !strings.Contains(status.State.LastRunSummary, "uploaded=0") {
+		t.Fatalf("LastRunSummary = %q, want uploaded=0", status.State.LastRunSummary)
+	}
+	if !strings.Contains(status.State.LastRunSummary, "cpa_count=25") {
+		t.Fatalf("LastRunSummary = %q, want cpa_count=25", status.State.LastRunSummary)
+	}
+}
+
+func TestRunOnceUsesFinalCPARecountAfterDeletesAndUploads(t *testing.T) {
+	var (
+		mu            sync.Mutex
+		listCalls     int
+		deletedNames  []string
+		uploadedNames []string
+		initialFiles  []map[string]any
+		finalFiles    []map[string]any
+		downloads     = map[string]*cpaDownloadedAccount{}
+	)
+
+	for i := 0; i < 22; i++ {
+		email := "unknown-" + strings.TrimSpace(time.Unix(int64(i), 0).UTC().Format("150405")) + "@example.com"
+		initialFiles = append(initialFiles, map[string]any{
+			"name":           "unknown-" + strings.TrimSpace(time.Unix(int64(i), 0).UTC().Format("150405")) + ".json",
+			"email":          email,
+			"status":         "error",
+			"status_message": `proxyconnect tcp: dial tcp 1.2.3.4:443: connect: connection refused`,
+			"disabled":       false,
+			"unavailable":    false,
+		})
+		finalFiles = append(finalFiles, map[string]any{
+			"name":           "unknown-final-" + strings.TrimSpace(time.Unix(int64(i), 0).UTC().Format("150405")) + ".json",
+			"email":          email,
+			"status":         "error",
+			"status_message": `proxyconnect tcp: dial tcp 1.2.3.4:443: connect: connection refused`,
+			"disabled":       false,
+			"unavailable":    false,
+		})
+	}
+	for i := 0; i < 3; i++ {
+		name := "target-error-" + strings.TrimSpace(time.Unix(int64(i), 0).UTC().Format("150405")) + ".json"
+		email := "target-" + strings.TrimSpace(time.Unix(int64(i), 0).UTC().Format("150405")) + "@example.com"
+		initialFiles = append(initialFiles, map[string]any{
+			"name":           name,
+			"email":          email,
+			"status":         "error",
+			"status_message": `{"error":{"type":"usage_limit_reached","resets_in_seconds":1200}}`,
+			"disabled":       false,
+			"unavailable":    false,
+		})
+		downloads[name] = &cpaDownloadedAccount{
+			RefreshToken: "rt-" + strings.TrimSpace(time.Unix(int64(i), 0).UTC().Format("150405")),
+			AccessToken:  "at-" + strings.TrimSpace(time.Unix(int64(i), 0).UTC().Format("150405")),
+			AccountID:    "acct-" + strings.TrimSpace(time.Unix(int64(i), 0).UTC().Format("150405")),
+			Email:        email,
+			PlanType:     "free",
+		}
+	}
+	for i := 0; i < 2; i++ {
+		finalFiles = append(finalFiles, map[string]any{
+			"name":           "uploaded-final-" + strings.TrimSpace(time.Unix(int64(i+100), 0).UTC().Format("150405")) + ".json",
+			"email":          "uploaded-final-" + strings.TrimSpace(time.Unix(int64(i+100), 0).UTC().Format("150405")) + "@example.com",
+			"status":         "active",
+			"status_message": "",
+			"disabled":       false,
+			"unavailable":    false,
+		})
+	}
+
+	handler := http.NewServeMux()
+	handler.HandleFunc("/v0/management/auth-files", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch r.Method {
+		case http.MethodGet:
+			listCalls++
+			if listCalls == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{"files": initialFiles})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": finalFiles})
+		case http.MethodDelete:
+			name := strings.TrimSpace(r.URL.Query().Get("name"))
+			if name == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			deletedNames = append(deletedNames, name)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPost:
+			var entry cpaExportEntry
+			if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			uploadedNames = append(uploadedNames, strings.TrimSpace(entry.Email))
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+	handler.HandleFunc("/v0/management/auth-files/download", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimSpace(r.URL.Query().Get("name"))
+		remote, ok := downloads[name]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"refresh_token": remote.RefreshToken,
+			"access_token":  remote.AccessToken,
+			"account_id":    remote.AccountID,
+			"email":         remote.Email,
+			"plan_type":     remote.PlanType,
+		})
+	})
+	handler.HandleFunc("/v0/management/auth-files/upload", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	service, db, store := newCPASyncTestService(t, server.URL)
+	if err := db.UpdateSystemSettings(context.Background(), &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		CPASyncEnabled:         true,
+		CPABaseURL:             server.URL,
+		CPAAdminKey:            "test-key",
+		CPAMinAccounts:         25,
+		CPASyncIntervalSeconds: 300,
+		MihomoDelayTimeoutMs:   5000,
+	}); err != nil {
+		t.Fatalf("UpdateSystemSettings() error: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		email := "candidate-" + strings.TrimSpace(time.Unix(int64(i+200), 0).UTC().Format("150405")) + "@example.com"
+		accountID, err := db.InsertAccount(context.Background(), email, "rt-candidate-"+strings.TrimSpace(time.Unix(int64(i+200), 0).UTC().Format("150405")), "")
+		if err != nil {
+			t.Fatalf("InsertAccount() error: %v", err)
+		}
+		if err := db.UpdateCredentials(context.Background(), accountID, map[string]interface{}{
+			"email":        email,
+			"account_id":   "acct-candidate-" + strings.TrimSpace(time.Unix(int64(i+200), 0).UTC().Format("150405")),
+			"access_token": "at-candidate-" + strings.TrimSpace(time.Unix(int64(i+200), 0).UTC().Format("150405")),
+		}); err != nil {
+			t.Fatalf("UpdateCredentials() error: %v", err)
+		}
+		store.AddAccount(&auth.Account{
+			DBID:         accountID,
+			RefreshToken: "rt-candidate-" + strings.TrimSpace(time.Unix(int64(i+200), 0).UTC().Format("150405")),
+			AccessToken:  "at-candidate-" + strings.TrimSpace(time.Unix(int64(i+200), 0).UTC().Format("150405")),
+			Email:        email,
+			AccountID:    "acct-candidate-" + strings.TrimSpace(time.Unix(int64(i+200), 0).UTC().Format("150405")),
+		})
+	}
+
+	status, err := service.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deletedNames) != 3 {
+		t.Fatalf("len(deletedNames) = %d, want 3 deleted target errors", len(deletedNames))
+	}
+	if len(uploadedNames) != 3 {
+		t.Fatalf("len(uploadedNames) = %d, want 3 uploads to refill from 22 to 25", len(uploadedNames))
+	}
+	if listCalls != 2 {
+		t.Fatalf("listCalls = %d, want 2 with final recount after remote changes", listCalls)
+	}
+	if status.State.LastCPAAccountCount != 24 {
+		t.Fatalf("LastCPAAccountCount = %d, want 24 from final CPA recount instead of optimistic local count 25", status.State.LastCPAAccountCount)
+	}
+	if !strings.Contains(status.State.LastRunSummary, "processed_errors=3") {
+		t.Fatalf("LastRunSummary = %q, want processed_errors=3", status.State.LastRunSummary)
+	}
+	if !strings.Contains(status.State.LastRunSummary, "uploaded=3") {
+		t.Fatalf("LastRunSummary = %q, want uploaded=3", status.State.LastRunSummary)
+	}
+	if !strings.Contains(status.State.LastRunSummary, "cpa_count=24") {
+		t.Fatalf("LastRunSummary = %q, want cpa_count=24 from final recount", status.State.LastRunSummary)
+	}
+}
+
+func TestRunOnceSecondFetchOnlyRecountsWithoutDeletingNewTargetErrors(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		listCalls   int
+		deleteCalls int
+	)
+
+	handler := http.NewServeMux()
+	handler.HandleFunc("/v0/management/auth-files", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch r.Method {
+		case http.MethodGet:
+			listCalls++
+			if listCalls == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"files": []map[string]any{
+						{
+							"name":           "target-error.json",
+							"email":          "target@example.com",
+							"status":         "error",
+							"status_message": `{"error":{"type":"usage_limit_reached","resets_in_seconds":1200}}`,
+							"disabled":       false,
+							"unavailable":    false,
+						},
+					},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{
+					{
+						"name":           "still-target-error.json",
+						"email":          "target@example.com",
+						"status":         "error",
+						"status_message": `{"error":{"type":"usage_limit_reached","resets_in_seconds":1200}}`,
+						"disabled":       false,
+						"unavailable":    false,
+					},
+				},
+			})
+		case http.MethodDelete:
+			deleteCalls++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+	handler.HandleFunc("/v0/management/auth-files/download", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"refresh_token": "rt-target",
+			"access_token":  "at-target",
+			"account_id":    "acct-target",
+			"email":         "target@example.com",
+			"plan_type":     "free",
+		})
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	service, db, _ := newCPASyncTestService(t, server.URL)
+	if err := db.UpdateSystemSettings(context.Background(), &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		CPASyncEnabled:         true,
+		CPABaseURL:             server.URL,
+		CPAAdminKey:            "test-key",
+		CPAMinAccounts:         0,
+		CPASyncIntervalSeconds: 300,
+		MihomoDelayTimeoutMs:   5000,
+	}); err != nil {
+		t.Fatalf("UpdateSystemSettings() error: %v", err)
+	}
+
+	status, err := service.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if listCalls != 2 {
+		t.Fatalf("listCalls = %d, want 2 with one initial fetch and one final recount", listCalls)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("deleteCalls = %d, want 1 because second fetch should not trigger another delete", deleteCalls)
+	}
+	if status.State.LastCPAAccountCount != 0 {
+		t.Fatalf("LastCPAAccountCount = %d, want 0 because target errors from final recount are not counted as effective", status.State.LastCPAAccountCount)
+	}
+	if !strings.Contains(status.State.LastRunSummary, "processed_errors=1") {
+		t.Fatalf("LastRunSummary = %q, want processed_errors=1 from the first fetch only", status.State.LastRunSummary)
+	}
+	if !strings.Contains(status.State.LastRunSummary, "uploaded=0") {
+		t.Fatalf("LastRunSummary = %q, want uploaded=0", status.State.LastRunSummary)
+	}
+	if !strings.Contains(status.State.LastRunSummary, "cpa_count=0") {
+		t.Fatalf("LastRunSummary = %q, want cpa_count=0 after final recount", status.State.LastRunSummary)
 	}
 }
 

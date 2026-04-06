@@ -615,6 +615,7 @@ export default function CPASync() {
   const mihomoBaseValue = form?.mihomo_base_url?.trim() ?? ''
   const mihomoSecretValue = form?.mihomo_secret?.trim() ?? ''
   const recentActions = [...(status?.state.recent_actions ?? [])].reverse()
+  const displayedCPAAccountCount = getNumberDetail(cpaDisplayStatus, 'account_count') ?? status?.state.last_cpa_account_count ?? 0
   const runtimeBusy = Boolean(status?.running || running || switching || testingCPA || testingMihomo)
   const runtimeStatusLabel = testingCPA || testingMihomo
     ? t('cpaSync.testing')
@@ -1080,7 +1081,7 @@ export default function CPASync() {
                   </div>
 
                   <div className="grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-3">
-                    <StatusTile label={t('cpaSync.cpaCount')} value={String(status?.state.last_cpa_account_count ?? 0)} tone="neutral" />
+                    <StatusTile label={t('cpaSync.cpaCount')} value={String(displayedCPAAccountCount)} tone="neutral" />
                     <StatusTile label={t('cpaSync.hourlyUploads')} value={String(status?.state.hourly_upload_count ?? 0)} tone="success" />
                     <StatusTile label={t('cpaSync.lastSwitchAt')} value={status?.state.last_switch_at ? formatRelativeTime(status.state.last_switch_at, { variant: 'compact' }) : '--'} tone="info" />
                     <StatusTile label={t('cpaSync.currentNode')} value={displayedCurrentMihomoNode} tone="warning" />

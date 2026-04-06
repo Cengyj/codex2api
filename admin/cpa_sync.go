@@ -401,6 +401,8 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 	uploadedCount := 0
 	firstErrorSummary := ""
 	downloadedTokens := make(map[string]struct{})
+	deletedRemote := false
+	uploadedRemote := false
 	remainingRecords := append([]cpaAuthFileRecord{}, records...)
 	for _, record := range records {
 		kind := detectCPAErrorKind(record.StatusMessage)
@@ -473,22 +475,13 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 				firstErrorSummary = fmt.Sprintf("delete %s failed: %v", record.Name, err)
 			}
 		} else {
+			deletedRemote = true
 			s.recordAction(state, "delete", "success", "deleted remote CPA account", record.Name)
 			remainingRecords = removeCPAAuthFileRecordByName(remainingRecords, record.Name)
 		}
 	}
 
 	records = remainingRecords
-	if processedErrors > 0 {
-		if refreshed, err := s.listCPAAuthFiles(ctx, settings); err == nil {
-			records = refreshed
-		} else {
-			s.recordAction(state, "run", "warning", fmt.Sprintf("refresh CPA auth files after cleanup failed: %v", err), "")
-			if firstErrorSummary == "" {
-				firstErrorSummary = fmt.Sprintf("refresh CPA auth files after cleanup failed: %v", err)
-			}
-		}
-	}
 	effectiveRecords := filterEffectiveCPAAuthFileRecords(records)
 	state.LastCPAAccountCount = len(effectiveRecords)
 
@@ -531,14 +524,34 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 						}
 						continue
 					}
+					uploadedRemote = true
 					uploadedCount++
 					state.HourlyUploadCount++
-					state.LastCPAAccountCount++
+					effectiveRecords = append(effectiveRecords, cpaAuthFileRecord{
+						Name:   name,
+						Email:  candidate.Email,
+						Status: "active",
+					})
 					s.recordAction(state, "upload", "success", fmt.Sprintf("uploaded %s", candidate.Email), name)
 				}
 			}
 		}
 	}
+	if deletedRemote || uploadedRemote {
+		refreshed, recountErr := s.listCPAAuthFiles(ctx, settings)
+		if recountErr != nil {
+			s.recordAction(state, "run", "warning", fmt.Sprintf("final CPA auth file recount failed: %v", recountErr), "")
+			if firstErrorSummary == "" {
+				firstErrorSummary = fmt.Sprintf("final CPA auth file recount failed: %v", recountErr)
+			} else {
+				firstErrorSummary = fmt.Sprintf("%s; final CPA auth file recount failed: %v", firstErrorSummary, recountErr)
+			}
+		} else {
+			records = refreshed
+			effectiveRecords = filterEffectiveCPAAuthFileRecords(records)
+		}
+	}
+	state.LastCPAAccountCount = len(effectiveRecords)
 
 	if eligible, reason := s.shouldAutoSwitchForHourlyLimit(state, settings, now); eligible {
 		if err := s.switchMihomo(ctx, settings, state, "hourly_upload_limit"); err != nil {
@@ -877,14 +890,16 @@ func (s *CPASyncService) runCPAConnectionTest(ctx context.Context, settings *cpa
 			Details:    map[string]any{"duration_ms": durationMs},
 		}
 	}
+	effectiveCount := len(filterEffectiveCPAAuthFileRecords(records))
 	return database.ConnectionTestStatus{
 		Ok:         boolPtr(true),
-		Message:    fmt.Sprintf("CPA connection OK, found %d auth files", len(records)),
+		Message:    fmt.Sprintf("CPA connection OK, found %d effective auth files", effectiveCount),
 		HTTPStatus: intPtr(httpStatus),
 		TestedAt:   testedAt,
 		Details: map[string]any{
-			"account_count": len(records),
-			"duration_ms":   durationMs,
+			"account_count":     effectiveCount,
+			"raw_account_count": len(records),
+			"duration_ms":       durationMs,
 		},
 	}
 }
@@ -1641,7 +1656,7 @@ func isEffectiveCPAAuthFileRecord(record cpaAuthFileRecord) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(record.Status)) {
-	case "error", "failed", "failure", "invalid", "disabled", "unavailable":
+	case "disabled", "unavailable":
 		return false
 	}
 	return detectCPAErrorKind(record.StatusMessage) == ""
