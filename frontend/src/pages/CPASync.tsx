@@ -60,8 +60,6 @@ type TestSignatureState = {
 type CPASyncPageMemory = {
   data: CPASyncPageData
   settingsForm: SystemSettings | null
-  localCPATestStatus: ConnectionTestStatus | null
-  localMihomoTestStatus: ConnectionTestStatus | null
   testSignatures: TestSignatureState
   activeView: CPASyncView
   configOpen: boolean
@@ -124,8 +122,6 @@ function createEmptyTestSignatures(): TestSignatureState {
 const cpaSyncPageMemory: CPASyncPageMemory = {
   data: createEmptyPageData(),
   settingsForm: null,
-  localCPATestStatus: null,
-  localMihomoTestStatus: null,
   testSignatures: createEmptyTestSignatures(),
   activeView: 'overview',
   configOpen: false,
@@ -526,8 +522,6 @@ export default function CPASync() {
   const hasPageSnapshot = Boolean(cpaSyncPageMemory.data.settings || cpaSyncPageMemory.data.status)
   const initialMihomoServiceCache = readMihomoServiceCache()
   const [settingsForm, setSettingsForm] = useState<SystemSettings | null>(() => cpaSyncPageMemory.settingsForm)
-  const [localCPATestStatus, setLocalCPATestStatus] = useState<ConnectionTestStatus | null>(() => cpaSyncPageMemory.localCPATestStatus)
-  const [localMihomoTestStatus, setLocalMihomoTestStatus] = useState<ConnectionTestStatus | null>(() => cpaSyncPageMemory.localMihomoTestStatus)
   const [testSignatures, setTestSignatures] = useState<TestSignatureState>(() => cpaSyncPageMemory.testSignatures)
   const [saving, setSaving] = useState(false)
   const [running, setRunning] = useState(false)
@@ -572,8 +566,8 @@ export default function CPASync() {
   const cpaConnectionDirty = haveFieldsChanged(form, persistedSettings, ['cpa_base_url', 'cpa_admin_key'])
   const mihomoServiceDirty = haveFieldsChanged(form, persistedSettings, ['mihomo_base_url', 'mihomo_secret'])
   const mihomoConnectionDirty = haveFieldsChanged(form, persistedSettings, ['mihomo_base_url', 'mihomo_secret', 'mihomo_strategy_group'])
-  const cpaTestStatus = normalizeTestStatus(testSignatures.cpa === cpaSettingsSignature && localCPATestStatus ? localCPATestStatus : status?.cpa_test_status)
-  const mihomoTestStatus = normalizeTestStatus(testSignatures.mihomo === mihomoSettingsSignature && localMihomoTestStatus ? localMihomoTestStatus : status?.mihomo_test_status)
+  const cpaTestStatus = normalizeTestStatus(status?.cpa_test_status)
+  const mihomoTestStatus = normalizeTestStatus(status?.mihomo_test_status)
   const localizedCPATestMessage = localizeConnectionMessage(cpaTestStatus.message, t)
   const localizedMihomoTestMessage = localizeConnectionMessage(mihomoTestStatus.message, t)
   const cpaConnectionNeedsRetest = (cpaConnectionDirty && testSignatures.cpa !== cpaSettingsSignature) || (formCPAMissing.length === 0 && hasMissingConfigMessage(localizedCPATestMessage))
@@ -615,7 +609,7 @@ export default function CPASync() {
   const mihomoBaseValue = form?.mihomo_base_url?.trim() ?? ''
   const mihomoSecretValue = form?.mihomo_secret?.trim() ?? ''
   const recentActions = [...(status?.state.recent_actions ?? [])].reverse()
-  const displayedCPAAccountCount = getNumberDetail(cpaDisplayStatus, 'account_count') ?? status?.state.last_cpa_account_count ?? 0
+  const displayedCPAAccountCount = status?.state.last_cpa_account_count ?? getNumberDetail(status?.cpa_test_status, 'account_count') ?? 0
   const runtimeBusy = Boolean(status?.running || running || switching || testingCPA || testingMihomo)
   const runtimeStatusLabel = testingCPA || testingMihomo
     ? t('cpaSync.testing')
@@ -627,10 +621,7 @@ export default function CPASync() {
     : runtimeBusy
       ? t('cpaSync.workerBusyDesc')
       : t('cpaSync.workerIdleDesc')
-  const selectedMihomoGroup = mihomoGroups.find((group) => group.name === form?.mihomo_strategy_group)
-  const currentNodeFromService = selectedMihomoGroup?.current?.trim() ?? ''
-  const currentNodeFromTest = getStringDetail(localMihomoTestStatus, 'current_node') || getStringDetail(mihomoTestStatus, 'current_node')
-  const displayedCurrentMihomoNode = status?.state.current_mihomo_node?.trim() || currentNodeFromService || currentNodeFromTest || '--'
+  const displayedCurrentMihomoNode = status?.state.current_mihomo_node?.trim() || getStringDetail(status?.mihomo_test_status, 'current_node') || '--'
   const shouldAutoProbeMihomoService = Boolean(mihomoBaseValue && mihomoSecretValue) && lastMihomoFetchKey !== mihomoServiceSettingsSignature
   const syncIntervalSeconds = status?.config.interval_seconds ?? form?.cpa_sync_interval_seconds ?? 300
   const nextRunCountdown = formatNextRunCountdown(status?.next_run_at, nowMs, Boolean(form?.cpa_sync_enabled), runtimeBusy, t)
@@ -692,8 +683,6 @@ export default function CPASync() {
   useEffect(() => {
     cpaSyncPageMemory.data = data
     cpaSyncPageMemory.settingsForm = settingsForm
-    cpaSyncPageMemory.localCPATestStatus = localCPATestStatus
-    cpaSyncPageMemory.localMihomoTestStatus = localMihomoTestStatus
     cpaSyncPageMemory.testSignatures = testSignatures
     cpaSyncPageMemory.activeView = activeView
     cpaSyncPageMemory.configOpen = configOpen
@@ -706,8 +695,6 @@ export default function CPASync() {
     configOpen,
     data,
     lastMihomoFetchKey,
-    localCPATestStatus,
-    localMihomoTestStatus,
     mihomoGroups,
     mihomoGroupsError,
     mihomoServiceStatus,
@@ -763,7 +750,6 @@ export default function CPASync() {
         mihomo_base_url: sourceForm.mihomo_base_url.trim(),
         mihomo_secret: sourceForm.mihomo_secret.trim(),
       })
-      const selectedGroup = (result.groups ?? []).find((group) => group.name === sourceForm.mihomo_strategy_group)
       setMihomoGroups(result.groups ?? [])
       setMihomoServiceStatus({
         ok: true,
@@ -774,13 +760,6 @@ export default function CPASync() {
           group_count: (result.groups ?? []).length,
         },
       })
-      patchStatus((current) => current ? ({
-        ...current,
-        state: {
-          ...current.state,
-          current_mihomo_node: selectedGroup?.current?.trim() || current.state.current_mihomo_node,
-        },
-      }) : current)
       setTestSignatures((prev) => ({ ...prev, mihomoService: fetchKey }))
       setLastMihomoFetchKey(fetchKey)
       if ((result.groups ?? []).length === 0) {
@@ -840,12 +819,6 @@ export default function CPASync() {
       const updated = await api.updateSettings(pickCPASyncSettings(form))
       setSettingsForm(updated)
       patchSettings(updated)
-      if (shouldClearCPATest) {
-        setLocalCPATestStatus(createEmptyTestStatus())
-      }
-      if (shouldClearMihomoTest) {
-        setLocalMihomoTestStatus(createEmptyTestStatus())
-      }
       if (shouldClearCPATest || shouldClearMihomoTest) {
         setTestSignatures((prev) => ({
           ...prev,
@@ -893,7 +866,6 @@ export default function CPASync() {
     setTestingCPA(true)
     try {
       const result = await api.testCPASyncCPA(pickCPASyncSettings(form))
-      setLocalCPATestStatus(result)
       setTestSignatures((prev) => ({ ...prev, cpa: cpaSettingsSignature }))
       patchStatus((current) => current ? ({
         ...current,
@@ -918,7 +890,6 @@ export default function CPASync() {
     setTestingMihomo(true)
     try {
       const result = await api.testCPASyncMihomo(pickCPASyncSettings(form))
-      setLocalMihomoTestStatus(result)
       setTestSignatures((prev) => ({ ...prev, mihomo: mihomoSettingsSignature }))
       patchStatus((current) => {
         if (!current) return current

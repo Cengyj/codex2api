@@ -199,42 +199,6 @@ func (db *DB) UpdateCPASyncState(ctx context.Context, state *CPASyncState) error
 	return err
 }
 
-func (db *DB) UpdateCPASyncCPATestStatus(ctx context.Context, status ConnectionTestStatus) error {
-	detailsJSON, err := json.Marshal(normalizeConnectionTestDetails(status.Details))
-	if err != nil {
-		return err
-	}
-	_, err = db.conn.ExecContext(ctx, `
-		INSERT INTO cpa_sync_state (id, recent_actions, cpa_test_ok, cpa_test_message, cpa_test_http_status, cpa_tested_at, cpa_test_details)
-		VALUES (1, '[]', $1, $2, $3, $4, $5)
-		ON CONFLICT (id) DO UPDATE SET
-			cpa_test_ok = EXCLUDED.cpa_test_ok,
-			cpa_test_message = EXCLUDED.cpa_test_message,
-			cpa_test_http_status = EXCLUDED.cpa_test_http_status,
-			cpa_tested_at = EXCLUDED.cpa_tested_at,
-			cpa_test_details = EXCLUDED.cpa_test_details
-	`, nullableBoolValue(status.Ok), status.Message, nullableIntValue(status.HTTPStatus), nullableRFC3339(status.TestedAt), string(detailsJSON))
-	return err
-}
-
-func (db *DB) UpdateCPASyncMihomoTestStatus(ctx context.Context, status ConnectionTestStatus) error {
-	detailsJSON, err := json.Marshal(normalizeConnectionTestDetails(status.Details))
-	if err != nil {
-		return err
-	}
-	_, err = db.conn.ExecContext(ctx, `
-		INSERT INTO cpa_sync_state (id, recent_actions, mihomo_test_ok, mihomo_test_message, mihomo_test_http_status, mihomo_tested_at, mihomo_test_details)
-		VALUES (1, '[]', $1, $2, $3, $4, $5)
-		ON CONFLICT (id) DO UPDATE SET
-			mihomo_test_ok = EXCLUDED.mihomo_test_ok,
-			mihomo_test_message = EXCLUDED.mihomo_test_message,
-			mihomo_test_http_status = EXCLUDED.mihomo_test_http_status,
-			mihomo_tested_at = EXCLUDED.mihomo_tested_at,
-			mihomo_test_details = EXCLUDED.mihomo_test_details
-	`, nullableBoolValue(status.Ok), status.Message, nullableIntValue(status.HTTPStatus), nullableRFC3339(status.TestedAt), string(detailsJSON))
-	return err
-}
-
 func parseNullableDBTime(raw interface{}) (string, error) {
 	if raw == nil {
 		return "", nil

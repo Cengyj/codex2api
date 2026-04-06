@@ -288,7 +288,8 @@ func (s *CPASyncService) ForceSwitch(ctx context.Context) (*cpaSyncStatusRespons
 		s.running.Store(false)
 		return nil, err
 	}
-	s.normalizeState(state, settings, time.Now().UTC())
+	now := time.Now().UTC()
+	s.normalizeState(state, settings, now)
 	if missing := settings.missingMihomoConfig(); len(missing) > 0 {
 		s.recordStateFailure(state, "switch_error", fmt.Sprintf("missing config: %s", strings.Join(missing, ", ")))
 		_ = s.db.UpdateCPASyncState(ctx, state)
@@ -298,8 +299,12 @@ func (s *CPASyncService) ForceSwitch(ctx context.Context) (*cpaSyncStatusRespons
 	if err := s.switchMihomo(ctx, settings, state, "manual_switch"); err != nil {
 		s.recordStateFailure(state, "switch_error", err.Error())
 	} else {
+		completedAt := time.Now().UTC()
+		if refreshErr := s.refreshMihomoSnapshot(ctx, settings, state, completedAt); refreshErr != nil && settings.hasMihomoConfig() {
+			s.recordAction(state, "switch", "warning", fmt.Sprintf("refresh Mihomo snapshot failed: %v", refreshErr), settings.MihomoStrategyGroup)
+		}
 		s.recordAction(state, "switch", "success", fmt.Sprintf("switched selector to %s", state.CurrentMihomoNode), settings.MihomoStrategyGroup)
-		state.LastRunAt = time.Now().UTC().Format(time.RFC3339)
+		state.LastRunAt = completedAt.Format(time.RFC3339)
 		state.LastRunStatus = "switch_success"
 		state.LastRunSummary = fmt.Sprintf("switched selector to %s", state.CurrentMihomoNode)
 		state.LastErrorSummary = ""
@@ -319,10 +324,7 @@ func (s *CPASyncService) TestCPA(ctx context.Context, req *cpaSyncConnectionTest
 	if err != nil {
 		return nil, err
 	}
-	state.CPATestStatus = normalized
-	if accountCount, ok := int64FromAny(normalized.Details["account_count"]); ok && accountCount >= 0 {
-		state.LastCPAAccountCount = int(accountCount)
-	}
+	s.syncCPAStateFromTestStatus(state, normalized)
 	if err := s.db.UpdateCPASyncState(ctx, state); err != nil {
 		return nil, err
 	}
@@ -340,10 +342,7 @@ func (s *CPASyncService) TestMihomo(ctx context.Context, req *cpaSyncConnectionT
 	if err != nil {
 		return nil, err
 	}
-	state.MihomoTestStatus = normalized
-	if currentNode := strings.TrimSpace(firstString(normalized.Details, "current_node")); currentNode != "" {
-		state.CurrentMihomoNode = currentNode
-	}
+	s.syncMihomoStateFromTestStatus(state, normalized)
 	if err := s.db.UpdateCPASyncState(ctx, state); err != nil {
 		return nil, err
 	}
@@ -552,6 +551,7 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 		}
 	}
 	state.LastCPAAccountCount = len(effectiveRecords)
+	s.syncCPAAccountCountSnapshot(state, state.LastCPAAccountCount, len(records), time.Now().UTC())
 
 	if eligible, reason := s.shouldAutoSwitchForHourlyLimit(state, settings, now); eligible {
 		if err := s.switchMihomo(ctx, settings, state, "hourly_upload_limit"); err != nil {
@@ -564,6 +564,9 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 		}
 	} else if reason != "" && settings.MaxUploadsPerHour > 0 && state.HourlyUploadCount >= settings.MaxUploadsPerHour {
 		s.recordAction(state, "switch", "info", reason, settings.MihomoStrategyGroup)
+	}
+	if err := s.refreshMihomoSnapshot(ctx, settings, state, time.Now().UTC()); err != nil && settings.hasMihomoConfig() {
+		s.recordAction(state, "switch", "warning", fmt.Sprintf("refresh Mihomo snapshot failed: %v", err), settings.MihomoStrategyGroup)
 	}
 
 	state.LastRunAt = now.Format(time.RFC3339)
@@ -1233,17 +1236,16 @@ func (s *CPASyncService) switchMihomo(ctx context.Context, settings *cpaSyncSett
 			continue
 		}
 
-		now := time.Now().UTC().Format(time.RFC3339)
-		state.CurrentMihomoNode = candidate
-		state.LastSwitchAt = now
+		switchAt := time.Now().UTC()
+		state.LastSwitchAt = switchAt.Format(time.RFC3339)
+		s.syncMihomoSnapshot(state, settings, &mihomoSelectorDetail{
+			Now: candidate,
+			All: append([]string{}, detail.All...),
+		}, switchAt)
 		if reason == "hourly_upload_limit" {
-			state.HourBucketStart = now
+			state.HourBucketStart = switchAt.Format(time.RFC3339)
 			state.HourlyUploadCount = 0
 		}
-		state.LastRunAt = now
-		state.LastRunStatus = "switch_success"
-		state.LastRunSummary = fmt.Sprintf("reason=%s, node=%s", reason, candidate)
-		state.LastErrorSummary = ""
 		return nil
 	}
 	if lastErr == nil {
@@ -1371,12 +1373,83 @@ func normalizeConnectionTestStatus(status database.ConnectionTestStatus) databas
 	return status
 }
 
+func (s *CPASyncService) syncCPAStateFromTestStatus(state *database.CPASyncState, status database.ConnectionTestStatus) {
+	if state == nil {
+		return
+	}
+	normalized := normalizeConnectionTestStatus(status)
+	state.CPATestStatus = normalized
+	if accountCount, ok := int64FromAny(normalized.Details["account_count"]); ok && accountCount >= 0 {
+		state.LastCPAAccountCount = int(accountCount)
+	}
+}
+
+func (s *CPASyncService) syncCPAAccountCountSnapshot(state *database.CPASyncState, effectiveCount, rawCount int, testedAt time.Time) {
+	s.syncCPAStateFromTestStatus(state, database.ConnectionTestStatus{
+		Ok:         boolPtr(true),
+		Message:    fmt.Sprintf("CPA connection OK, found %d effective auth files", effectiveCount),
+		HTTPStatus: intPtr(http.StatusOK),
+		TestedAt:   formatConnectionTestedAt(testedAt),
+		Details: map[string]any{
+			"account_count":     effectiveCount,
+			"raw_account_count": rawCount,
+		},
+	})
+}
+
+func (s *CPASyncService) refreshMihomoSnapshot(ctx context.Context, settings *cpaSyncSettings, state *database.CPASyncState, testedAt time.Time) error {
+	if state == nil || settings == nil || !settings.hasMihomoConfig() {
+		return nil
+	}
+	detail, err := s.getMihomoSelector(ctx, settings)
+	if err != nil {
+		return err
+	}
+	s.syncMihomoSnapshot(state, settings, detail, testedAt)
+	return nil
+}
+
+func (s *CPASyncService) syncMihomoStateFromTestStatus(state *database.CPASyncState, status database.ConnectionTestStatus) {
+	if state == nil {
+		return
+	}
+	normalized := normalizeConnectionTestStatus(status)
+	state.MihomoTestStatus = normalized
+	if currentNode := strings.TrimSpace(firstString(normalized.Details, "current_node")); currentNode != "" {
+		state.CurrentMihomoNode = currentNode
+	}
+}
+
+func (s *CPASyncService) syncMihomoSnapshot(state *database.CPASyncState, settings *cpaSyncSettings, detail *mihomoSelectorDetail, testedAt time.Time) {
+	if settings == nil || detail == nil {
+		return
+	}
+	s.syncMihomoStateFromTestStatus(state, database.ConnectionTestStatus{
+		Ok:         boolPtr(true),
+		Message:    fmt.Sprintf("Mihomo connection OK, strategy group has %d candidates", len(detail.All)),
+		HTTPStatus: intPtr(http.StatusOK),
+		TestedAt:   formatConnectionTestedAt(testedAt),
+		Details: map[string]any{
+			"current_node":    detail.Now,
+			"candidate_count": len(detail.All),
+			"strategy_group":  settings.MihomoStrategyGroup,
+		},
+	})
+}
+
 func boolPtr(value bool) *bool {
 	return &value
 }
 
 func intPtr(value int) *int {
 	return &value
+}
+
+func formatConnectionTestedAt(testedAt time.Time) string {
+	if testedAt.IsZero() {
+		return ""
+	}
+	return testedAt.UTC().Format(time.RFC3339)
 }
 
 func (s *CPASyncService) applyCPAHeaders(req *http.Request, adminKey string) {

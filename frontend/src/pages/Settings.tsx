@@ -157,6 +157,7 @@ export default function Settings() {
     cpa_max_accounts: 0,
     cpa_max_uploads_per_hour: 0,
     cpa_switch_after_uploads: 0,
+    cpa_sync_interval_seconds: 300,
     mihomo_base_url: '',
     mihomo_secret: '',
     mihomo_strategy_group: '',

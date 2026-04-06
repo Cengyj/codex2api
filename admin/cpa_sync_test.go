@@ -573,6 +573,12 @@ func TestRunOnceSwitchesMihomoWhenHourlyUploadCountReachesLimit(t *testing.T) {
 	if status.State.CurrentMihomoNode != "node-b" {
 		t.Fatalf("status current node = %q, want %q", status.State.CurrentMihomoNode, "node-b")
 	}
+	if got := strings.TrimSpace(firstString(status.MihomoTestStatus.Details, "current_node")); got != "node-b" {
+		t.Fatalf("mihomo_test_status current_node = %q, want %q", got, "node-b")
+	}
+	if status.MihomoTestStatus.TestedAt == "" {
+		t.Fatal("MihomoTestStatus.TestedAt is empty, want run snapshot to refresh Mihomo panel data")
+	}
 	if status.State.LastSwitchAt == "" {
 		t.Fatal("LastSwitchAt is empty, want recorded switch time")
 	}
@@ -639,8 +645,53 @@ func TestSwitchMihomoRetriesNextCandidateWhenDelayTestFails(t *testing.T) {
 	if state.CurrentMihomoNode != "node-c" {
 		t.Fatalf("state current node = %q, want %q", state.CurrentMihomoNode, "node-c")
 	}
+	if got := strings.TrimSpace(firstString(state.MihomoTestStatus.Details, "current_node")); got != "node-c" {
+		t.Fatalf("mihomo_test_status current_node = %q, want %q", got, "node-c")
+	}
 	if state.LastSwitchAt == "" {
 		t.Fatal("LastSwitchAt is empty, want recorded switch time")
+	}
+}
+
+func TestForceSwitchKeepsMihomoRuntimeAndSnapshotInSync(t *testing.T) {
+	mihomoServer, currentNode := newMihomoTestServer(t, "node-a", []string{"node-a", "node-b"}, nil)
+	defer mihomoServer.Close()
+
+	service, db, _ := newCPASyncTestService(t, "http://example.invalid")
+	if err := db.UpdateSystemSettings(context.Background(), &database.SystemSettings{
+		MaxConcurrency:       2,
+		TestConcurrency:      1,
+		TestModel:            "gpt-5.4",
+		CPASyncEnabled:       true,
+		CPABaseURL:           "http://example.invalid",
+		CPAAdminKey:          "test-key",
+		MihomoBaseURL:        mihomoServer.URL,
+		MihomoSecret:         "mihomo-secret",
+		MihomoStrategyGroup:  "Selector",
+		MihomoDelayTimeoutMs: 5000,
+	}); err != nil {
+		t.Fatalf("UpdateSystemSettings() error: %v", err)
+	}
+
+	status, err := service.ForceSwitch(context.Background())
+	if err != nil {
+		t.Fatalf("ForceSwitch() error: %v", err)
+	}
+
+	if *currentNode != "node-b" {
+		t.Fatalf("current Mihomo node = %q, want %q", *currentNode, "node-b")
+	}
+	if status.State.CurrentMihomoNode != "node-b" {
+		t.Fatalf("state current node = %q, want %q", status.State.CurrentMihomoNode, "node-b")
+	}
+	if got := strings.TrimSpace(firstString(status.MihomoTestStatus.Details, "current_node")); got != "node-b" {
+		t.Fatalf("mihomo_test_status current_node = %q, want %q", got, "node-b")
+	}
+	if status.MihomoTestStatus.TestedAt == "" {
+		t.Fatal("MihomoTestStatus.TestedAt is empty, want refreshed Mihomo snapshot after force switch")
+	}
+	if status.State.LastRunStatus != "switch_success" {
+		t.Fatalf("LastRunStatus = %q, want %q", status.State.LastRunStatus, "switch_success")
 	}
 }
 
@@ -792,6 +843,15 @@ func TestRunOnceFallsBackToPostDeleteCountWhenCPARefreshFails(t *testing.T) {
 	}
 	if status.State.LastCPAAccountCount != 1 {
 		t.Fatalf("LastCPAAccountCount = %d, want 1 after successful delete fallback", status.State.LastCPAAccountCount)
+	}
+	if got, ok := int64FromAny(status.CPATestStatus.Details["account_count"]); !ok || got != 1 {
+		t.Fatalf("cpa_test_status account_count = %v, ok=%t, want 1,true", status.CPATestStatus.Details["account_count"], ok)
+	}
+	if got, ok := int64FromAny(status.CPATestStatus.Details["raw_account_count"]); !ok || got != 1 {
+		t.Fatalf("cpa_test_status raw_account_count = %v, ok=%t, want 1,true", status.CPATestStatus.Details["raw_account_count"], ok)
+	}
+	if status.CPATestStatus.TestedAt == "" {
+		t.Fatal("CPATestStatus.TestedAt is empty, want refreshed CPA snapshot even on partial success")
 	}
 	if status.State.LastRunStatus != "partial_success" {
 		t.Fatalf("LastRunStatus = %q, want %q", status.State.LastRunStatus, "partial_success")
@@ -1212,6 +1272,15 @@ func TestRunOnceSecondFetchOnlyRecountsWithoutDeletingNewTargetErrors(t *testing
 	if status.State.LastCPAAccountCount != 0 {
 		t.Fatalf("LastCPAAccountCount = %d, want 0 because target errors from final recount are not counted as effective", status.State.LastCPAAccountCount)
 	}
+	if got, ok := int64FromAny(status.CPATestStatus.Details["account_count"]); !ok || got != 0 {
+		t.Fatalf("cpa_test_status account_count = %v, ok=%t, want 0,true", status.CPATestStatus.Details["account_count"], ok)
+	}
+	if got, ok := int64FromAny(status.CPATestStatus.Details["raw_account_count"]); !ok || got != 1 {
+		t.Fatalf("cpa_test_status raw_account_count = %v, ok=%t, want 1,true", status.CPATestStatus.Details["raw_account_count"], ok)
+	}
+	if status.CPATestStatus.TestedAt == "" {
+		t.Fatal("CPATestStatus.TestedAt is empty, want run snapshot to refresh CPA panel data")
+	}
 	if !strings.Contains(status.State.LastRunSummary, "processed_errors=1") {
 		t.Fatalf("LastRunSummary = %q, want processed_errors=1 from the first fetch only", status.State.LastRunSummary)
 	}
@@ -1364,6 +1433,9 @@ func TestTestMihomoPersistsCurrentNodeToSyncState(t *testing.T) {
 	if state.CurrentMihomoNode != *currentNode {
 		t.Fatalf("CurrentMihomoNode = %q, want %q", state.CurrentMihomoNode, *currentNode)
 	}
+	if got := strings.TrimSpace(firstString(state.MihomoTestStatus.Details, "current_node")); got != *currentNode {
+		t.Fatalf("mihomo_test_status current_node = %q, want %q", got, *currentNode)
+	}
 	if state.MihomoTestStatus.TestedAt == "" {
 		t.Fatal("MihomoTestStatus.TestedAt is empty, want persisted test status")
 	}
@@ -1404,6 +1476,9 @@ func TestTestCPAPersistsAccountCountToSyncState(t *testing.T) {
 	}
 	if state.LastCPAAccountCount != 3 {
 		t.Fatalf("LastCPAAccountCount = %d, want 3", state.LastCPAAccountCount)
+	}
+	if got, ok := int64FromAny(state.CPATestStatus.Details["account_count"]); !ok || got != 3 {
+		t.Fatalf("state cpa_test_status account_count = %v, ok=%t, want 3,true", state.CPATestStatus.Details["account_count"], ok)
 	}
 	if state.CPATestStatus.TestedAt == "" {
 		t.Fatal("CPATestStatus.TestedAt is empty, want persisted test status")
