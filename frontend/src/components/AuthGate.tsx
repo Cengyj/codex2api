@@ -1,7 +1,7 @@
 import type { PropsWithChildren } from 'react'
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { ADMIN_AUTH_REQUIRED_EVENT, getAdminKey, setAdminKey } from '../api'
+import { ADMIN_AUTH_REQUIRED_EVENT, createAdminHeaders, getAdminKey, readAdminErrorResponse, setAdminKey } from '../api'
 import logoImg from '../assets/logo.png'
 
 type AuthStatus = 'checking' | 'authenticated' | 'need_login'
@@ -13,22 +13,46 @@ export default function AuthGate({ children }: PropsWithChildren) {
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
-  const checkAuth = useCallback(async () => {
-    try {
-      const headers: Record<string, string> = {}
-      const key = getAdminKey()
-      if (key) headers['X-Admin-Key'] = key
-      const res = await fetch('/api/admin/health', { headers })
-      if (res.status === 401) {
-        setAdminKey('')
-        setStatus('need_login')
-      } else {
-        setStatus('authenticated')
-      }
-    } catch {
-      setStatus('authenticated')
+  const validateAdminHealth = useCallback(async (adminKey?: string) => {
+    const headers = adminKey
+      ? { 'X-Admin-Key': adminKey }
+      : createAdminHeaders()
+    const res = await fetch('/api/admin/health', { headers })
+
+    if (res.ok) {
+      return { authenticated: true, status: res.status, message: '' }
+    }
+
+    return {
+      authenticated: false,
+      status: res.status,
+      message: await readAdminErrorResponse(res),
     }
   }, [])
+
+  const checkAuth = useCallback(async () => {
+    try {
+      const result = await validateAdminHealth()
+      if (result.authenticated) {
+        setError('')
+        setStatus('authenticated')
+        return
+      }
+
+      if (result.status === 401 || result.status === 429) {
+        setAdminKey('')
+        setError(result.status === 401 ? '' : result.message || t('auth.error'))
+        setStatus('need_login')
+        return
+      }
+
+      setError(result.message || t('auth.error'))
+      setStatus('need_login')
+    } catch {
+      setError(t('auth.error'))
+      setStatus('need_login')
+    }
+  }, [t, validateAdminHealth])
 
   useEffect(() => {
     void checkAuth()
@@ -61,22 +85,23 @@ export default function AuthGate({ children }: PropsWithChildren) {
   }, [checkAuth])
 
   const handleLogin = async () => {
-    if (!inputKey.trim()) {
+    const nextKey = inputKey.trim()
+    if (!nextKey) {
       setError(t('auth.error'))
       return
     }
     setSubmitting(true)
     setError('')
     try {
-      const res = await fetch('/api/admin/health', {
-        headers: { 'X-Admin-Key': inputKey.trim() },
-      })
-      if (res.status === 401) {
-        setError(t('auth.error'))
-      } else {
-        setAdminKey(inputKey.trim())
+      const result = await validateAdminHealth(nextKey)
+      if (result.authenticated) {
+        setAdminKey(nextKey)
         setStatus('authenticated')
+        return
       }
+
+      setError(result.status === 401 ? t('auth.error') : (result.message || t('auth.error')))
+      setStatus('need_login')
     } catch {
       setError(t('auth.error'))
     } finally {

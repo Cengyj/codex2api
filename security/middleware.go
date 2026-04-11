@@ -165,11 +165,12 @@ type IPRateLimiter struct {
 	mu       sync.Mutex
 	ticker   *time.Ticker
 	stopChan chan struct{}
+	stopOnce sync.Once
 }
 
 type visitor struct {
-	tokens    int
-	lastSeen  time.Time
+	tokens   int
+	lastSeen time.Time
 }
 
 // NewIPRateLimiter creates a new rate limiter
@@ -191,7 +192,9 @@ func (l *IPRateLimiter) Stop() {
 		l.ticker.Stop()
 	}
 	l.mu.Unlock()
-	close(l.stopChan)
+	l.stopOnce.Do(func() {
+		close(l.stopChan)
+	})
 }
 
 // Allow checks if a request from this IP is allowed
@@ -251,7 +254,6 @@ func (l *IPRateLimiter) cleanup() {
 func IsSensitiveEndpoint(path string) bool {
 	sensitivePaths := []string{
 		"/api/admin/accounts",
-		"/api/admin/keys",
 		"/api/admin/settings",
 		"/api/admin/proxies",
 	}

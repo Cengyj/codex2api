@@ -47,7 +47,14 @@ const (
 	contextAPIKeyID     = "apiKeyID"
 	contextAPIKeyName   = "apiKeyName"
 	contextAPIKeyMasked = "apiKeyMasked"
+
+	maxInboundBodyBytes        = int64(security.MaxRequestBodySize)
+	maxUpstreamErrorBodyBytes  = int64(256 * 1024)
+	maxUpstreamMessageLogChars = 2000
+	usageLogWriteTimeout       = 3 * time.Second
 )
+
+var errLimitedBodyTooLarge = errors.New("body too large")
 
 // NewHandler 创建处理器
 func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCfg *DeviceProfileConfig) *Handler {
@@ -136,7 +143,14 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 	if h.db == nil || input == nil {
 		return
 	}
-	_ = h.db.InsertUsageLog(context.Background(), input)
+	cloned := *input
+	go func(entry database.UsageLogInput) {
+		ctx, cancel := context.WithTimeout(context.Background(), usageLogWriteTimeout)
+		defer cancel()
+		if err := h.db.InsertUsageLog(ctx, &entry); err != nil {
+			log.Printf("usage log write failed: %v", err)
+		}
+	}(cloned)
 }
 
 func populateAPIKeyMetaFromContext(c *gin.Context, input *database.UsageLogInput) {
@@ -382,11 +396,64 @@ func parseUsageLimitDetails(body []byte) (usageLimitDetails, bool) {
 	}, true
 }
 
+func readLimitedBytes(r io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		limit = maxInboundBodyBytes
+	}
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, errLimitedBodyTooLarge
+	}
+	return data, nil
+}
+
+func readUpstreamErrorBody(resp *http.Response) []byte {
+	if resp == nil || resp.Body == nil {
+		return nil
+	}
+	body, err := readLimitedBytes(resp.Body, maxUpstreamErrorBodyBytes)
+	if err == nil {
+		return body
+	}
+	if errors.Is(err, errLimitedBodyTooLarge) {
+		return []byte("upstream error body too large")
+	}
+	return []byte{}
+}
+
+func sanitizeUpstreamErrorForLog(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	masked := security.MaskSensitiveData(string(body))
+	return security.SafeTruncate(masked, maxUpstreamMessageLogChars)
+}
+
+func upstreamErrorMessage(body []byte) string {
+	msg := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+	if msg == "" {
+		msg = strings.TrimSpace(string(body))
+	}
+	msg = security.MaskSensitiveData(msg)
+	msg = security.SafeTruncate(msg, maxUpstreamMessageLogChars)
+	if msg == "" {
+		return "upstream error"
+	}
+	return msg
+}
+
 // Responses 处理 /v1/responses 请求（原生透传，增强输入验证）
 func (h *Handler) Responses(c *gin.Context) {
 	// 1. 读取请求体
-	rawBody, err := io.ReadAll(c.Request.Body)
+	rawBody, err := readLimitedBytes(c.Request.Body, maxInboundBodyBytes)
 	if err != nil {
+		if errors.Is(err, errLimitedBodyTooLarge) {
+			api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request body too large", api.ErrorTypeInvalidRequest))
+			return
+		}
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
@@ -461,7 +528,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := h.store.NextProxy()
+		proxyURL := h.store.ResolveRuntimeProxy(c.Request.Context(), account)
 		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
 
 		// 提取 API Key 用于设备指纹稳定化
@@ -483,14 +550,18 @@ func (h *Handler) Responses(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			transportKind := classifyTransportFailure(reqErr)
+			if transportKind != "" {
+				h.store.ReportRequestFailure(account, transportKind, time.Duration(durationMs)*time.Millisecond)
+				h.store.InvalidateProxyAssignment(c.Request.Context(), account, "network_error", reqErr.Error())
 			}
 			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
+			if transportKind == "" || !h.store.GetSwitchProxyOnNetworkError() {
+				excludeAccounts[account.ID()] = true
+			}
 
 			// 不可重试的结构化错误直接返回
-			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+			if !IsRetryableError(reqErr) && transportKind == "" {
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
@@ -507,12 +578,12 @@ func (h *Handler) Responses(c *gin.Context) {
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
 			}
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody := readUpstreamErrorBody(resp)
 			resp.Body.Close()
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 
-			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
+			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, sanitizeUpstreamErrorForLog(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
@@ -656,7 +727,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
 			}
@@ -726,7 +797,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.PersistUsageSnapshot(account, usagePct)
 		}
 		if outcome.penalize {
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
@@ -747,8 +818,12 @@ func (h *Handler) Responses(c *gin.Context) {
 
 func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 1. 读取请求体
-	rawBody, err := io.ReadAll(c.Request.Body)
+	rawBody, err := readLimitedBytes(c.Request.Body, maxInboundBodyBytes)
 	if err != nil {
+		if errors.Is(err, errLimitedBodyTooLarge) {
+			api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request body too large", api.ErrorTypeInvalidRequest))
+			return
+		}
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
@@ -825,7 +900,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := h.store.NextProxy()
+		proxyURL := h.store.ResolveRuntimeProxy(c.Request.Context(), account)
 		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
 
 		// 提取 API Key 用于设备指纹稳定化
@@ -847,14 +922,18 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			transportKind := classifyTransportFailure(reqErr)
+			if transportKind != "" {
+				h.store.ReportRequestFailure(account, transportKind, time.Duration(durationMs)*time.Millisecond)
+				h.store.InvalidateProxyAssignment(c.Request.Context(), account, "network_error", reqErr.Error())
 			}
 			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
+			if transportKind == "" || !h.store.GetSwitchProxyOnNetworkError() {
+				excludeAccounts[account.ID()] = true
+			}
 
 			// 不可重试的结构化错误直接返回
-			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+			if !IsRetryableError(reqErr) && transportKind == "" {
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
@@ -871,12 +950,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
 			}
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody := readUpstreamErrorBody(resp)
 			resp.Body.Close()
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 
-			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
+			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, sanitizeUpstreamErrorForLog(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
@@ -1025,7 +1104,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
 			}
@@ -1095,7 +1174,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.PersistUsageSnapshot(account, usagePct)
 		}
 		if outcome.penalize {
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
@@ -1398,7 +1477,7 @@ func parseFloat(s string) float64 {
 func (h *Handler) sendUpstreamError(c *gin.Context, statusCode int, body []byte) {
 	c.JSON(statusCode, gin.H{
 		"error": gin.H{
-			"message": fmt.Sprintf("上游返回错误 (status %d): %s", statusCode, string(body)),
+			"message": fmt.Sprintf("上游返回错误 (status %d): %s", statusCode, upstreamErrorMessage(body)),
 			"type":    "upstream_error",
 			"code":    fmt.Sprintf("upstream_%d", statusCode),
 		},

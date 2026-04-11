@@ -159,18 +159,6 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	usageStats, err := h.db.GetUsageStats(ctx)
-	if err != nil {
-		writeInternalError(c, err)
-		return
-	}
-
-	trafficSnapshot, err := h.db.GetTrafficSnapshot(ctx)
-	if err != nil {
-		writeInternalError(c, err)
-		return
-	}
-
 	dbHealthy := h.db.Ping(ctx) == nil
 	dbStats := h.db.Stats()
 	dbUsage := 0.0
@@ -208,13 +196,6 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 	runtime.ReadMemStats(&memStats)
 	processMemory = memStats.Sys
 
-	var activeRequests int64
-	var totalRuntimeRequests int64
-	for _, acc := range h.store.Accounts() {
-		activeRequests += acc.GetActiveRequests()
-		totalRuntimeRequests += acc.GetTotalRequests()
-	}
-
 	c.JSON(200, opsOverviewResponse{
 		UpdatedAt:      time.Now().Format(time.RFC3339),
 		UptimeSeconds:  int64(time.Since(h.startedAt).Seconds()),
@@ -237,10 +218,6 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 			AvailableAccounts: h.store.AvailableCount(),
 			TotalAccounts:     h.store.AccountCount(),
 		},
-		Requests: opsRequestsResponse{
-			Active: activeRequests,
-			Total:  totalRuntimeRequests,
-		},
 		Postgres: opsDatabaseResponse{
 			Healthy:      dbHealthy,
 			Open:         dbStats.OpenConnections,
@@ -257,18 +234,6 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 			StaleConns:   redisStale,
 			PoolSize:     redisPoolSize,
 			UsagePercent: redisUsage,
-		},
-		Traffic: opsTrafficResponse{
-			QPS:           trafficSnapshot.QPS,
-			QPSPeak:       trafficSnapshot.QPSPeak,
-			TPS:           trafficSnapshot.TPS,
-			TPSPeak:       trafficSnapshot.TPSPeak,
-			RPM:           usageStats.RPM,
-			TPM:           usageStats.TPM,
-			ErrorRate:     usageStats.ErrorRate,
-			TodayRequests: usageStats.TodayRequests,
-			TodayTokens:   usageStats.TodayTokens,
-			RPMLimit:      h.rateLimiter.GetRPM(),
 		},
 	})
 }

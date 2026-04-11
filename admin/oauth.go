@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
 
@@ -112,7 +114,17 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 		ProxyURL    string `json:"proxy_url"`
 		RedirectURI string `json:"redirect_uri"`
 	}
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if trimmed := strings.TrimSpace(req.ProxyURL); trimmed != "" {
+		if err := security.ValidateProxyURL(trimmed); err != nil {
+			writeError(c, http.StatusBadRequest, "代理URL无效")
+			return
+		}
+		req.ProxyURL = trimmed
+	}
 
 	redirectURI := strings.TrimSpace(req.RedirectURI)
 	if redirectURI == "" {
@@ -191,12 +203,17 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 
 	proxyURL := sess.ProxyURL
 	if trimmed := strings.TrimSpace(req.ProxyURL); trimmed != "" {
+		if err := security.ValidateProxyURL(trimmed); err != nil {
+			writeError(c, http.StatusBadRequest, "代理URL无效")
+			return
+		}
 		proxyURL = trimmed
 	}
 
 	tokenResp, accountInfo, err := doOAuthCodeExchange(c.Request.Context(), req.Code, sess.CodeVerifier, sess.RedirectURI, proxyURL)
 	if err != nil {
-		writeError(c, http.StatusBadGateway, "授权码兑换失败: "+err.Error())
+		log.Printf("[admin] OAuth code exchange failed session=%s: %v", req.SessionID, err)
+		writeError(c, http.StatusBadGateway, "授权码兑换失败")
 		return
 	}
 	globalOAuthStore.delete(req.SessionID)
@@ -219,7 +236,7 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 
 	id, err := h.db.InsertAccount(ctx, name, tokenResp.RefreshToken, proxyURL)
 	if err != nil {
-		writeError(c, http.StatusInternalServerError, "账号写入数据库失败: "+err.Error())
+		writeLoggedInternalError(c, "账号写入数据库失败", err)
 		return
 	}
 	h.db.InsertAccountEventAsync(id, "added", "oauth")

@@ -11,7 +11,7 @@ import (
 	"github.com/codex2api/proxy"
 )
 
-// ProbeUsageSnapshot 主动发送最小探针请求刷新账号用量
+// ProbeUsageSnapshot 涓诲姩鍙戦€佹渶灏忔帰閽堣姹傚埛鏂拌处鍙风敤閲?
 func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account) error {
 	if account == nil {
 		return nil
@@ -25,7 +25,7 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 	}
 
 	payload := buildTestPayload(h.store.GetTestModel())
-	proxyOverride := h.store.EffectiveProxyURL(account)
+	proxyOverride := h.store.ResolveMaintenanceProxy(ctx, account)
 	resp, err := executeRequest(ctx, account, payload, "", proxyOverride, "", nil, nil)
 	if err != nil {
 		return err
@@ -42,7 +42,7 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 	switch resp.StatusCode {
 	case http.StatusOK:
 		h.store.ReportRequestSuccess(account, 0)
-		// 只有用量未耗尽时才重置状态
+		// 鍙湁鐢ㄩ噺鏈€楀敖鏃舵墠閲嶇疆鐘舵€?
 		if !hasUsage || usagePct < 100 {
 			h.store.ClearCooldown(account)
 		}
@@ -61,6 +61,6 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 		} else if resp.StatusCode >= 400 {
 			h.store.ReportRequestFailure(account, "client", 0)
 		}
-		return fmt.Errorf("探针返回状态 %d", resp.StatusCode)
+		return fmt.Errorf("鎺㈤拡杩斿洖鐘舵€?%d", resp.StatusCode)
 	}
 }

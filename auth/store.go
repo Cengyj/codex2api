@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -16,6 +17,23 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 )
+
+var ErrAccountNotFound = errors.New("account not found")
+
+type accountNotFoundError struct {
+	dbID int64
+}
+
+func (e *accountNotFoundError) Error() string {
+	if e == nil {
+		return "账号不存在"
+	}
+	return fmt.Sprintf("账号 %d 不存在", e.dbID)
+}
+
+func (e *accountNotFoundError) Unwrap() error {
+	return ErrAccountNotFound
+}
 
 // AccountStatus 账号状态
 type AccountStatus int
@@ -47,11 +65,19 @@ type Account struct {
 	Email        string
 	PlanType     string
 	// ProxyURL stores only the explicit account-level proxy. Empty means follow proxy page rules.
-	ProxyURL       string
-	Status         AccountStatus
-	CooldownUtil   time.Time
-	CooldownReason string // rate_limited / unauthorized / 空
-	ErrorMsg       string
+	ProxyURL              string
+	ProxyMode             string
+	ProxyProviderURL      string
+	ProxySchemeDefault    string
+	AssignedProxyURL      string
+	ProxyLastSwitchedAt   time.Time
+	ProxyNextRotationAt   time.Time
+	ProxyLastSwitchReason string
+	ProxyLastError        string
+	Status                AccountStatus
+	CooldownUtil          time.Time
+	CooldownReason        string // rate_limited / unauthorized / ??
+	ErrorMsg              string
 
 	// 用量进度（从 Codex 响应头被动解析）
 	UsagePercent7d        float64 // 7d 窗口使用率 0-100+
@@ -400,11 +426,19 @@ func (a *Account) usageExhaustedLocked() bool {
 	return a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") && a.UsagePercent7d >= 100
 }
 
-// NeedsRefresh 检查 AT 是否需要刷新（过期前 5 分钟刷新）
-func (a *Account) NeedsRefresh() bool {
+// NeedsRefreshWithin 检查 AT 是否在指定窗口内需要刷新。
+func (a *Account) NeedsRefreshWithin(window time.Duration) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return time.Until(a.ExpiresAt) < 5*time.Minute
+	if window <= 0 {
+		window = 5 * time.Minute
+	}
+	return time.Until(a.ExpiresAt) < window
+}
+
+// NeedsRefresh 检查 AT 是否需要刷新（默认过期前 5 分钟刷新）
+func (a *Account) NeedsRefresh() bool {
+	return a.NeedsRefreshWithin(5 * time.Minute)
 }
 
 // SetCooldown 设置冷却时间
@@ -693,32 +727,66 @@ func (a *Account) GetLastUsedAt() time.Time {
 
 // Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
-	mu                    sync.RWMutex
-	accounts              []*Account
-	globalProxy           string
-	maxConcurrency        int64        // 每账号最大并发数
-	testConcurrency       int64        // 批量测试并发数
-	testModel             atomic.Value // 测试连接使用的模型（string）
-	db                    *database.DB
-	tokenCache            cache.TokenCache
-	usageProbeMu          sync.RWMutex
-	usageProbe            func(context.Context, *Account) error
-	usageProbeBatch       atomic.Bool
-	recoveryProbeBatch    atomic.Bool
-	autoCleanUnauthorized atomic.Bool
-	autoCleanRateLimited  atomic.Bool
-	autoCleanFullUsage    atomic.Bool
-	autoCleanError        atomic.Bool
-	autoCleanExpired      atomic.Bool
-	autoCleanupBatch      atomic.Bool
-	maxRetries            int64 // 请求失败最大重试次数（换号重试）
-	stopCh                chan struct{}
-	wg                    sync.WaitGroup
+	mu                          sync.RWMutex
+	accounts                    []*Account
+	globalProxy                 string
+	globalProxyMode             string
+	globalProxyProvider         string
+	globalProxyScheme           string
+	autoAssignProxyIfMissing    bool
+	switchProxyOnNetworkError   bool
+	proxyRotationHours          int
+	disableProxyDuringImport    bool
+	maxConcurrency              int64        // 每账号最大并发数
+	testConcurrency             int64        // 批量测试并发数
+	testModel                   atomic.Value // 测试连接使用的模型（string）
+	db                          *database.DB
+	tokenCache                  cache.TokenCache
+	usageProbeMu                sync.RWMutex
+	usageProbe                  func(context.Context, *Account) error
+	refreshScanEnabled          atomic.Bool
+	refreshScanInterval         int64
+	refreshPreExpireWindow      int64
+	refreshMaxConcurrency       int64
+	refreshOnImportEnabled      atomic.Bool
+	refreshOnImportConcurrency  int64
+	usageProbeBatch             atomic.Bool
+	refreshBatch                atomic.Bool
+	usageProbeEnabled           atomic.Bool
+	usageProbeStaleAfter        int64
+	usageProbeMaxConcurrency    int64
+	recoveryProbeBatch          atomic.Bool
+	recoveryProbeEnabled        atomic.Bool
+	recoveryProbeMinInterval    int64
+	recoveryProbeMaxConcurrency int64
+	autoCleanUnauthorized       atomic.Bool
+	autoCleanRateLimited        atomic.Bool
+	autoCleanFullUsage          atomic.Bool
+	autoCleanError              atomic.Bool
+	autoCleanExpired            atomic.Bool
+	autoCleanupBatch            atomic.Bool
+	maxRetries                  int64 // 请求失败最大重试次数（换号重试）
+	stopCh                      chan struct{}
+	stopOnce                    sync.Once
+	wg                          sync.WaitGroup
+	backgroundRefreshWakeCh     chan struct{}
+	importRefreshQueue          chan int64
+	importRefreshInFlight       int64
+	nextRefreshScanAt           int64
+	refreshCycleRunning         atomic.Bool
+	refreshCycleStartedAt       int64
+	refreshCycleFinishedAt      int64
+	refreshCycleTotalAccounts   int64
+	refreshCycleTargetAccounts  int64
+	refreshCycleProcessed       int64
+	refreshCycleSuccess         int64
+	refreshCycleFailure         int64
 
 	// 代理池
 	proxyPool        []string // 已启用的代理 URL 列表
-	proxyPoolEnabled bool     // 代理池是否开启
-	proxyRoundRobin  uint64   // 轮询计数器
+	proxyPoolRows    []*database.ProxyRow
+	proxyPoolEnabled bool   // 代理池是否开启
+	proxyRoundRobin  uint64 // 轮询计数器
 
 	// Fast scheduler POC（默认关闭，通过环境变量启用）
 	fastScheduler        atomic.Pointer[FastScheduler]
@@ -753,20 +821,53 @@ func truthyEnv(v string) bool {
 func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSettings) *Store {
 	if settings == nil {
 		settings = &database.SystemSettings{
-			MaxConcurrency:  2,
-			TestConcurrency: 50,
-			TestModel:       "gpt-5.4",
-			ProxyURL:        "",
+			MaxConcurrency:                  2,
+			TestConcurrency:                 50,
+			TestModel:                       "gpt-5.4",
+			ProxyURL:                        "",
+			ProxyMode:                       ProxyModeNone,
+			ProxySchemeDefault:              defaultProxyScheme,
+			AutoAssignProxyIfMissing:        true,
+			SwitchProxyOnNetworkError:       true,
+			ProxyRotationHours:              defaultProxyRotationHours,
+			DisableProxyDuringImport:        true,
+			RefreshScanEnabled:              true,
+			RefreshScanIntervalSeconds:      120,
+			RefreshPreExpireSeconds:         300,
+			RefreshMaxConcurrency:           10,
+			RefreshOnImportEnabled:          true,
+			RefreshOnImportConcurrency:      10,
+			UsageProbeEnabled:               true,
+			UsageProbeStaleAfterSeconds:     600,
+			UsageProbeMaxConcurrency:        4,
+			RecoveryProbeEnabled:            true,
+			RecoveryProbeMinIntervalSeconds: 1800,
+			RecoveryProbeMaxConcurrency:     2,
 		}
 	}
+	if settings.ProxySchemeDefault == "" {
+		settings.ProxySchemeDefault = defaultProxyScheme
+	}
+	if settings.ProxyRotationHours <= 0 {
+		settings.ProxyRotationHours = defaultProxyRotationHours
+	}
 	s := &Store{
-		globalProxy:      settings.ProxyURL,
-		maxConcurrency:   int64(settings.MaxConcurrency),
-		testConcurrency:  int64(settings.TestConcurrency),
-		db:               db,
-		tokenCache:       tc,
-		stopCh:           make(chan struct{}),
-		proxyPoolEnabled: settings.ProxyPoolEnabled,
+		globalProxy:               settings.ProxyURL,
+		globalProxyMode:           normalizeProxyMode(settings.ProxyMode, settings.ProxyURL, settings.ProxyProviderURL, settings.ProxyPoolEnabled, false),
+		globalProxyProvider:       strings.TrimSpace(settings.ProxyProviderURL),
+		globalProxyScheme:         normalizeProxyScheme(settings.ProxySchemeDefault),
+		autoAssignProxyIfMissing:  settings.AutoAssignProxyIfMissing,
+		switchProxyOnNetworkError: settings.SwitchProxyOnNetworkError,
+		proxyRotationHours:        settings.ProxyRotationHours,
+		disableProxyDuringImport:  settings.DisableProxyDuringImport,
+		maxConcurrency:            int64(settings.MaxConcurrency),
+		testConcurrency:           int64(settings.TestConcurrency),
+		db:                        db,
+		tokenCache:                tc,
+		stopCh:                    make(chan struct{}),
+		backgroundRefreshWakeCh:   make(chan struct{}, 1),
+		importRefreshQueue:        make(chan int64, 4096),
+		proxyPoolEnabled:          settings.ProxyPoolEnabled,
 	}
 	s.testModel.Store(settings.TestModel)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
@@ -774,37 +875,48 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
 	s.autoCleanError.Store(settings.AutoCleanError)
 	s.autoCleanExpired.Store(settings.AutoCleanExpired)
+	s.refreshScanEnabled.Store(settings.RefreshScanEnabled || settings.RefreshScanIntervalSeconds == 0)
+	atomic.StoreInt64(&s.refreshScanInterval, int64(normalizeRefreshScanIntervalSeconds(settings.RefreshScanIntervalSeconds)))
+	atomic.StoreInt64(&s.refreshPreExpireWindow, int64(normalizeRefreshPreExpireSeconds(settings.RefreshPreExpireSeconds)))
+	atomic.StoreInt64(&s.refreshMaxConcurrency, int64(normalizeRefreshMaxConcurrency(settings.RefreshMaxConcurrency)))
+	s.refreshOnImportEnabled.Store(settings.RefreshOnImportEnabled || settings.RefreshOnImportConcurrency == 0)
+	atomic.StoreInt64(&s.refreshOnImportConcurrency, int64(normalizeRefreshOnImportConcurrency(settings.RefreshOnImportConcurrency)))
+	s.usageProbeEnabled.Store(settings.UsageProbeEnabled || settings.UsageProbeStaleAfterSeconds == 0)
+	atomic.StoreInt64(&s.usageProbeStaleAfter, int64(normalizeUsageProbeStaleAfterSeconds(settings.UsageProbeStaleAfterSeconds)))
+	atomic.StoreInt64(&s.usageProbeMaxConcurrency, int64(normalizeUsageProbeMaxConcurrency(settings.UsageProbeMaxConcurrency)))
+	s.recoveryProbeEnabled.Store(settings.RecoveryProbeEnabled || settings.RecoveryProbeMinIntervalSeconds == 0)
+	atomic.StoreInt64(&s.recoveryProbeMinInterval, int64(normalizeRecoveryProbeMinIntervalSeconds(settings.RecoveryProbeMinIntervalSeconds)))
+	atomic.StoreInt64(&s.recoveryProbeMaxConcurrency, int64(normalizeRecoveryProbeMaxConcurrency(settings.RecoveryProbeMaxConcurrency)))
 	retries := int64(settings.MaxRetries)
 	if retries <= 0 {
-		retries = 2 // 默认重试 2 次
+		retries = 2 // ?????? 2 ??
 	}
 	atomic.StoreInt64(&s.maxRetries, retries)
 	s.allowRemoteMigration.Store(settings.AllowRemoteMigration)
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
 	}
-	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
 	if fastEnabled {
 		s.fastScheduler.Store(NewFastScheduler(int64(settings.MaxConcurrency)))
-		log.Printf("快速调度器已启用（请求热路径将优先走本地内存调度器）")
+		log.Printf("fast scheduler enabled")
 	}
-
-	// 加载代理池
-	if settings.ProxyPoolEnabled {
+	if settings.ProxyPoolEnabled && db != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if proxies, err := db.ListEnabledProxies(ctx); err == nil {
 			urls := make([]string, 0, len(proxies))
 			for _, p := range proxies {
-				urls = append(urls, p.URL)
+				if strings.TrimSpace(p.URL) != "" {
+					urls = append(urls, p.URL)
+				}
 			}
 			s.proxyPool = urls
-			log.Printf("代理池已加载: %d 个活跃代理", len(urls))
+			s.proxyPoolRows = proxies
+			log.Printf("proxy pool loaded: %d", len(urls))
 		}
 	}
-
 	return s
 }
 
@@ -892,23 +1004,16 @@ func (s *Store) GetProxyURL() string {
 func (s *Store) SetProxyURL(url string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.globalProxy = url
+	s.globalProxy = strings.TrimSpace(url)
+	s.globalProxyMode = normalizeProxyMode(s.globalProxyMode, s.globalProxy, s.globalProxyProvider, s.proxyPoolEnabled, false)
 }
 
 // EffectiveProxyURL resolves the proxy for background account maintenance actions.
 func (s *Store) EffectiveProxyURL(acc *Account) string {
-	if acc != nil {
-		acc.mu.RLock()
-		proxyURL := strings.TrimSpace(acc.ProxyURL)
-		acc.mu.RUnlock()
-		if proxyURL != "" {
-			return proxyURL
-		}
-	}
 	if s == nil {
 		return ""
 	}
-	return s.NextProxy()
+	return s.ResolveMaintenanceProxy(context.Background(), acc)
 }
 
 // NextProxy 轮询获取下一个代理 URL
@@ -949,12 +1054,14 @@ func (s *Store) ReloadProxyPool() error {
 	}
 	urls := make([]string, 0, len(proxies))
 	for _, p := range proxies {
-		urls = append(urls, p.URL)
+		if strings.TrimSpace(p.URL) != "" {
+			urls = append(urls, p.URL)
+		}
 	}
 	s.mu.Lock()
 	s.proxyPool = urls
+	s.proxyPoolRows = proxies
 	s.mu.Unlock()
-	log.Printf("代理池已重新加载: %d 个活跃代理", len(urls))
 	return nil
 }
 
@@ -1054,11 +1161,19 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		}
 
 		account := &Account{
-			DBID:         row.ID,
-			RefreshToken: rt,
-			ProxyURL:     strings.TrimSpace(row.ProxyURL),
-			HealthTier:   HealthTierWarm,
-			AddedAt:      row.CreatedAt.UnixNano(),
+			DBID:                  row.ID,
+			RefreshToken:          rt,
+			ProxyURL:              strings.TrimSpace(row.ProxyURL),
+			ProxyMode:             normalizeProxyMode(row.ProxyMode, row.ProxyURL, row.ProxyProviderURL, false, true),
+			ProxyProviderURL:      strings.TrimSpace(row.ProxyProviderURL),
+			ProxySchemeDefault:    normalizeProxyScheme(row.ProxySchemeDefault),
+			AssignedProxyURL:      strings.TrimSpace(row.AssignedProxyURL),
+			ProxyLastSwitchedAt:   row.ProxyLastSwitchedAt,
+			ProxyNextRotationAt:   row.ProxyNextRotationAt,
+			ProxyLastSwitchReason: strings.TrimSpace(row.ProxyLastSwitchReason),
+			ProxyLastError:        strings.TrimSpace(row.ProxyLastError),
+			HealthTier:            HealthTierWarm,
+			AddedAt:               row.CreatedAt.UnixNano(),
 		}
 		if row.Locked {
 			atomic.StoreInt32(&account.Locked, 1)
@@ -1134,10 +1249,12 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 
 // StartBackgroundRefresh 启动后台定期刷新
 func (s *Store) StartBackgroundRefresh() {
+	s.startImportRefreshWorkers()
+	s.scheduleNextRefreshScan(time.Now().Add(s.GetRefreshScanInterval()))
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		refreshTicker := time.NewTicker(2 * time.Minute)
+		refreshTicker := time.NewTicker(s.GetRefreshScanInterval())
 		autoCleanupTicker := time.NewTicker(30 * time.Second)
 		fullUsageCleanupTicker := time.NewTicker(5 * time.Minute)
 		expiredCleanupTicker := time.NewTicker(15 * time.Minute)
@@ -1150,11 +1267,13 @@ func (s *Store) StartBackgroundRefresh() {
 		defer rebuildSchedulerTicker.Stop()
 
 		for {
+			refreshCh := refreshTicker.C
 			select {
-			case <-refreshTicker.C:
-				s.parallelRefreshAll(context.Background())
-				s.TriggerUsageProbeAsync()
-				s.TriggerRecoveryProbeAsync()
+			case <-refreshCh:
+				s.runPeriodicRefreshMaintenance(context.Background())
+			case <-s.backgroundRefreshWakeCh:
+				refreshTicker.Stop()
+				refreshTicker = time.NewTicker(s.GetRefreshScanInterval())
 			case <-autoCleanupTicker.C:
 				s.TriggerAutoCleanupAsync()
 			case <-fullUsageCleanupTicker.C:
@@ -1180,7 +1299,9 @@ func (s *Store) StartBackgroundRefresh() {
 
 // Stop 停止后台刷新
 func (s *Store) Stop() {
-	close(s.stopCh)
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
 	s.wg.Wait()
 }
 
@@ -1646,6 +1767,9 @@ func (s *Store) SetUsageProbeFunc(fn func(context.Context, *Account) error) {
 
 // TriggerUsageProbeAsync 异步触发一次批量用量探针
 func (s *Store) TriggerUsageProbeAsync() {
+	if s == nil || !s.GetUsageProbeEnabled() {
+		return
+	}
 	if !s.usageProbeBatch.CompareAndSwap(false, true) {
 		return
 	}
@@ -1658,6 +1782,9 @@ func (s *Store) TriggerUsageProbeAsync() {
 
 // TriggerRecoveryProbeAsync 异步触发一次封禁账号恢复探测
 func (s *Store) TriggerRecoveryProbeAsync() {
+	if s == nil || !s.GetRecoveryProbeEnabled() {
+		return
+	}
 	if !s.recoveryProbeBatch.CompareAndSwap(false, true) {
 		return
 	}
@@ -1871,7 +1998,7 @@ func (s *Store) parallelProbeUsage(ctx context.Context) {
 	s.usageProbeMu.RLock()
 	probeFn := s.usageProbe
 	s.usageProbeMu.RUnlock()
-	if probeFn == nil {
+	if probeFn == nil || !s.GetUsageProbeEnabled() {
 		return
 	}
 
@@ -1880,11 +2007,12 @@ func (s *Store) parallelProbeUsage(ctx context.Context) {
 	copy(accounts, s.accounts)
 	s.mu.RUnlock()
 
-	sem := make(chan struct{}, 4)
+	sem := make(chan struct{}, s.GetUsageProbeMaxConcurrency())
 	var wg sync.WaitGroup
+	staleAfter := s.GetUsageProbeStaleAfter()
 
 	for _, acc := range accounts {
-		if !acc.NeedsUsageProbe(10 * time.Minute) {
+		if !acc.NeedsUsageProbe(staleAfter) {
 			continue
 		}
 		if !acc.TryBeginUsageProbe() {
@@ -1913,7 +2041,7 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 	s.usageProbeMu.RLock()
 	probeFn := s.usageProbe
 	s.usageProbeMu.RUnlock()
-	if probeFn == nil {
+	if probeFn == nil || !s.GetRecoveryProbeEnabled() {
 		return
 	}
 
@@ -1922,11 +2050,13 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 	copy(accounts, s.accounts)
 	s.mu.RUnlock()
 
-	sem := make(chan struct{}, 2)
+	sem := make(chan struct{}, s.GetRecoveryProbeMaxConcurrency())
 	var wg sync.WaitGroup
+	minInterval := s.GetRecoveryProbeMinInterval()
+	refreshWindow := s.GetRefreshPreExpireWindow()
 
 	for _, acc := range accounts {
-		if !acc.NeedsRecoveryProbe(30 * time.Minute) {
+		if !acc.NeedsRecoveryProbe(minInterval) {
 			continue
 		}
 		if !acc.TryBeginRecoveryProbe() {
@@ -1943,7 +2073,7 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 			probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
 
-			if account.NeedsRefresh() {
+			if account.NeedsRefreshWithin(refreshWindow) {
 				if err := s.refreshAccount(probeCtx, account); err != nil {
 					log.Printf("[账号 %d] 恢复探测前刷新失败: %v", account.DBID, err)
 				}
@@ -2002,7 +2132,7 @@ func (s *Store) RefreshSingle(ctx context.Context, dbID int64) error {
 	s.mu.RUnlock()
 
 	if target == nil {
-		return fmt.Errorf("账号 %d 不存在", dbID)
+		return &accountNotFoundError{dbID: dbID}
 	}
 	return s.refreshAccount(ctx, target)
 }
@@ -2045,27 +2175,11 @@ func (s *Store) parallelRefreshAll(ctx context.Context) {
 	copy(accounts, s.accounts)
 	s.mu.RUnlock()
 
-	sem := make(chan struct{}, 10)
+	sem := make(chan struct{}, s.GetRefreshMaxConcurrency())
 	var wg sync.WaitGroup
 
 	for i, acc := range accounts {
-		if acc.Status == StatusError {
-			continue
-		}
-		if acc.IsBanned() {
-			continue
-		}
-		if acc.HasActiveCooldown() {
-			continue
-		}
-		// AT-only 账号无 RT，无法刷新
-		acc.mu.RLock()
-		hasRT := acc.RefreshToken != ""
-		acc.mu.RUnlock()
-		if !hasRT {
-			continue
-		}
-		if !acc.NeedsRefresh() {
+		if !s.shouldRefreshAccount(acc) {
 			continue
 		}
 
@@ -2076,8 +2190,10 @@ func (s *Store) parallelRefreshAll(ctx context.Context) {
 			defer func() { <-sem }()
 
 			if err := s.refreshAccount(ctx, account); err != nil {
+				s.recordRefreshCycleResult(false)
 				log.Printf("[账号 %d] 刷新失败: %v", idx+1, err)
 			} else {
+				s.recordRefreshCycleResult(true)
 				log.Printf("[账号 %d] 刷新成功: email=%s", idx+1, account.Email)
 			}
 		}(i, acc)
@@ -2153,12 +2269,16 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 			}
 			return nil
 		}
+		if waitErr != nil {
+			return fmt.Errorf("wait for refresh completion: %w", waitErr)
+		}
+		return fmt.Errorf("refresh already in progress for account %d", dbID)
 	} else if acquired {
 		defer s.tokenCache.ReleaseRefreshLock(ctx, dbID)
 	}
 
 	// 3. 执行 RT 刷新
-	proxy := s.EffectiveProxyURL(acc)
+	proxy := s.ResolveMaintenanceProxy(ctx, acc)
 	td, info, err := refreshWithRetryFunc(ctx, rt, proxy)
 	if err != nil {
 		if isNonRetryable(err) {

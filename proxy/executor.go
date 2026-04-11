@@ -87,17 +87,6 @@ func recyclePooledClient(account *auth.Account, proxyURL string) {
 	}
 }
 
-func recyclePooledClientForAccount(account *auth.Account) {
-	if account == nil {
-		return
-	}
-
-	account.Mu().RLock()
-	proxyURL := account.ProxyURL
-	account.Mu().RUnlock()
-	recyclePooledClient(account, proxyURL)
-}
-
 // getPooledClient 获取或创建连接池中的 HTTP Client（按账号隔离，TTL 自动淘汰）
 func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 	key := clientPoolKey(account, proxyURL)

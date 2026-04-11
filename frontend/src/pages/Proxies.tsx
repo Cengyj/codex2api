@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Globe, Plus, Trash2, Play, MapPin, Loader2, Zap, ChevronLeft, ChevronRight, Eye, EyeOff } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
+import { formatRelativeTime } from '../utils/time'
 import { api, type ProxyRow, type ProxyTestResult } from '../api'
 
 const PAGE_SIZE = 10
@@ -345,24 +346,46 @@ export default function Proxies() {
                             />
                           </td>
                           <td className="p-3 max-w-[380px]">
-                            <div className="flex items-center gap-2">
-                              <button
-                                onClick={() => {
-                                  setRevealedIds(prev => {
-                                    const next = new Set(prev)
-                                    if (next.has(p.id)) next.delete(p.id)
-                                    else next.add(p.id)
-                                    return next
-                                  })
-                                }}
-                                className="shrink-0 flex items-center justify-center size-6 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-all"
-                                title={revealedIds.has(p.id) ? 'Hide' : 'Show'}
-                              >
-                                {revealedIds.has(p.id) ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
-                              </button>
-                              <span className="font-mono text-[20px] font-bold break-all text-foreground">
-                                {revealedIds.has(p.id) ? p.url : maskUrl(p.url)}
-                              </span>
+                            <div className="space-y-1">
+                              <div className="flex items-center gap-2">
+                                <button
+                                  onClick={() => {
+                                    setRevealedIds(prev => {
+                                      const next = new Set(prev)
+                                      if (next.has(p.id)) next.delete(p.id)
+                                      else next.add(p.id)
+                                      return next
+                                    })
+                                  }}
+                                  className="shrink-0 flex items-center justify-center size-6 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-all"
+                                  title={revealedIds.has(p.id) ? 'Hide' : 'Show'}
+                                >
+                                  {revealedIds.has(p.id) ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                                </button>
+                                <span className="font-mono text-[20px] font-bold break-all text-foreground">
+                                  {revealedIds.has(p.id) ? p.url : maskUrl(p.url)}
+                                </span>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                                <span
+                                  className={`px-2 py-0.5 rounded-full font-semibold ${p.source_type === 'dynamic' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-200' : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200'}`}
+                                >
+                                  {p.source_type === 'dynamic' ? t('proxies.typeDynamic') : t('proxies.typeStatic')}
+                                </span>
+                                {p.provider_url && (
+                                  <span>
+                                    {t('proxies.providerLabel')}: <span className="font-mono">{maskUrl(p.provider_url)}</span>
+                                  </span>
+                                )}
+                              </div>
+                              {p.last_resolved_proxy && (
+                                <div className="text-[11px] text-muted-foreground">
+                                  {t('proxies.lastResolved', {
+                                    proxy: p.last_resolved_proxy,
+                                    time: formatRelativeTime(p.last_resolved_at),
+                                  })}
+                                </div>
+                              )}
                             </div>
                           </td>
                           <td className="p-3">

@@ -9,13 +9,15 @@ import (
 	"io"
 	"log"
 	"net/http"
+	neturl "net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
+
+const maxBodyCacheBytes = int64(10 * 1024 * 1024) // 10MB
 
 // Version represents an API version
 type Version struct {
@@ -122,12 +124,12 @@ func IsVersionSupported(version Version) bool {
 
 // RequestContext holds request-scoped information
 type RequestContext struct {
-	RequestID   string
-	Version     Version
-	StartTime   time.Time
-	APIKey      string
-	Model       string
-	Stream      bool
+	RequestID string
+	Version   Version
+	StartTime time.Time
+	APIKey    string
+	Model     string
+	Stream    bool
 }
 
 // GetRequestContext retrieves the request context from gin context
@@ -183,10 +185,15 @@ func randInt() int {
 func BodyCacheMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.Body != nil && c.Request.Body != http.NoBody {
-			body, err := io.ReadAll(c.Request.Body)
+			body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxBodyCacheBytes+1))
 			if err != nil {
 				log.Printf("Failed to read request body: %v", err)
 				c.Next()
+				return
+			}
+			if int64(len(body)) > maxBodyCacheBytes {
+				SendError(c, NewAPIError(ErrCodeInvalidRequest, "Request body too large", ErrorTypeInvalidRequest))
+				c.Abort()
 				return
 			}
 			c.Set("raw_body", body)
@@ -234,14 +241,14 @@ func LoggingMiddleware() gin.HandlerFunc {
 
 		// Build log entry
 		logEntry := map[string]interface{}{
-			"timestamp":    start.Format(time.RFC3339),
-			"method":       c.Request.Method,
-			"path":         path,
-			"status":       status,
-			"latency_ms":   float64(latency.Nanoseconds()) / 1e6,
-			"client_ip":    c.ClientIP(),
-			"request_id":   requestID,
-			"api_version":  extractVersionFromPath(c.Request.URL.Path).String(),
+			"timestamp":   start.Format(time.RFC3339),
+			"method":      c.Request.Method,
+			"path":        path,
+			"status":      status,
+			"latency_ms":  float64(latency.Nanoseconds()) / 1e6,
+			"client_ip":   c.ClientIP(),
+			"request_id":  requestID,
+			"api_version": extractVersionFromPath(c.Request.URL.Path).String(),
 		}
 
 		// Add error if present
@@ -264,19 +271,62 @@ func LoggingMiddleware() gin.HandlerFunc {
 // CORSMiddleware provides CORS headers
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
-		c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Request-ID, X-API-Version")
-		c.Header("Access-Control-Expose-Headers", "X-Request-ID, X-API-Version, X-API-Supported-Versions")
-		c.Header("Access-Control-Max-Age", "86400")
+		origin := strings.TrimSpace(c.GetHeader("Origin"))
+		allowOrigin, originAllowed := resolveAllowedCORSOrigin(c, origin)
+
+		if originAllowed {
+			c.Header("Vary", "Origin")
+			c.Header("Access-Control-Allow-Origin", allowOrigin)
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
+			c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Admin-Key, X-Request-ID, X-API-Version")
+			c.Header("Access-Control-Expose-Headers", "X-Request-ID, X-API-Version, X-API-Supported-Versions")
+			c.Header("Access-Control-Max-Age", "86400")
+		}
 
 		if c.Request.Method == "OPTIONS" {
+			if origin != "" && !originAllowed {
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			}
 			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
 
 		c.Next()
 	}
+}
+
+func resolveAllowedCORSOrigin(c *gin.Context, origin string) (string, bool) {
+	if origin == "" {
+		return "", false
+	}
+
+	parsedOrigin, err := neturl.Parse(origin)
+	if err != nil || parsedOrigin.Scheme == "" || parsedOrigin.Host == "" {
+		return "", false
+	}
+
+	originHost := strings.ToLower(strings.TrimSpace(parsedOrigin.Host))
+	if originHost == "" {
+		return "", false
+	}
+
+	candidateHosts := []string{
+		c.Request.Host,
+		c.GetHeader("X-Forwarded-Host"),
+		c.GetHeader("X-Original-Host"),
+	}
+
+	for _, candidate := range candidateHosts {
+		for _, rawHost := range strings.Split(candidate, ",") {
+			host := strings.ToLower(strings.TrimSpace(rawHost))
+			if host != "" && host == originHost {
+				return origin, true
+			}
+		}
+	}
+
+	return "", false
 }
 
 // RateLimitHeadersMiddleware adds rate limit headers to responses
@@ -338,46 +388,15 @@ func ContentTypeMiddleware() gin.HandlerFunc {
 }
 
 // TimeoutMiddleware adds a timeout to requests by setting a context deadline.
-// Downstream handlers should respect the context deadline via c.Request.Context().Done().
-// For a more robust solution, use http.TimeoutHandler at the server level.
+// It does not run Gin handlers in a separate goroutine; downstream handlers must
+// respect c.Request.Context().Done() and stop their own work when canceled.
+// For a hard timeout response body, use http.TimeoutHandler at the server level.
 func TimeoutMiddleware(timeout time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Wrap the request context with a timeout
 		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
 		defer cancel()
-
-		// Replace the request with one using the timeout context
 		c.Request = c.Request.WithContext(ctx)
-
-		// Use a channel to track completion
-		done := make(chan struct{})
-		var once sync.Once
-
-		// Run the next handlers
-		go func() {
-			c.Next()
-			once.Do(func() { close(done) })
-		}()
-
-		select {
-		case <-done:
-			// Request completed normally
-		case <-ctx.Done():
-			// Timeout occurred - abort and return error
-			// Only abort if not already written
-			if !c.IsAborted() && c.Writer.Status() == 0 {
-				c.Abort()
-				c.Writer.WriteHeader(http.StatusGatewayTimeout)
-				json.NewEncoder(c.Writer).Encode(ErrorResponse{
-					Error: APIError{
-						Code:    ErrCodeUpstreamTimeout,
-						Message: "Request timeout",
-						Type:    ErrorTypeServer,
-					},
-				})
-			}
-			once.Do(func() { close(done) })
-		}
+		c.Next()
 	}
 }
 

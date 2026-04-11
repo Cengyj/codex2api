@@ -1,4 +1,4 @@
-# Codex2API 贡献指南
+﻿# Codex2API 贡献指南
 
 感谢您对 Codex2API 项目的关注！本指南将帮助您了解如何参与项目贡献。
 
@@ -360,7 +360,7 @@ docker compose -f docker-compose.test.yml down
 添加新 API 时，需要更新：
 
 1. `docs/API.md` - 端点说明
-2. `admin/handler.go` 或 `proxy/handler.go` - 代码注释
+2. `admin/handler.go` / `auth/store.go` / `auth/proxy_manager.go` - 代码注释
 3. 如有必要，更新 README.md
 
 ---
@@ -408,3 +408,4 @@ git push origin v1.0.0
 - 遵守开源社区规范
 
 感谢您的贡献！
+

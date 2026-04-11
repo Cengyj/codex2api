@@ -16,19 +16,34 @@ import (
 
 // AccountRow 数据库中的账号行
 type AccountRow struct {
-	ID             int64
-	Name           string
-	Platform       string
-	Type           string
-	Credentials    map[string]interface{}
-	ProxyURL       string
-	Status         string
-	CooldownReason string
-	CooldownUntil  sql.NullTime
-	ErrorMessage   string
-	Locked         bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID                    int64
+	Name                  string
+	Platform              string
+	Type                  string
+	Credentials           map[string]interface{}
+	ProxyURL              string
+	ProxyMode             string
+	ProxyProviderURL      string
+	ProxySchemeDefault    string
+	AssignedProxyURL      string
+	ProxyLastSwitchedAt   time.Time
+	ProxyNextRotationAt   time.Time
+	ProxyLastSwitchReason string
+	ProxyLastError        string
+	Status                string
+	CooldownReason        string
+	CooldownUntil         sql.NullTime
+	ErrorMessage          string
+	Locked                bool
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+}
+
+type ProxyConfigInput struct {
+	Mode        string
+	URL         string
+	ProviderURL string
+	Scheme      string
 }
 
 // GetCredential 从 credentials JSONB 获取字符串字段
@@ -197,6 +212,14 @@ func (db *DB) migrate(ctx context.Context) error {
 		type          VARCHAR(50) DEFAULT 'oauth',
 		credentials   JSONB NOT NULL DEFAULT '{}',
 		proxy_url     VARCHAR(500) DEFAULT '',
+		proxy_mode    VARCHAR(50) DEFAULT 'inherit',
+		proxy_provider_url VARCHAR(1000) DEFAULT '',
+		proxy_scheme_default VARCHAR(20) DEFAULT 'http',
+		assigned_proxy_url VARCHAR(500) DEFAULT '',
+		proxy_last_switched_at TIMESTAMPTZ NULL,
+		proxy_next_rotation_at TIMESTAMPTZ NULL,
+		proxy_last_switch_reason TEXT DEFAULT '',
+		proxy_last_error TEXT DEFAULT '',
 		status        VARCHAR(50) DEFAULT 'active',
 		error_message TEXT DEFAULT '',
 		created_at    TIMESTAMPTZ DEFAULT NOW(),
@@ -206,6 +229,14 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_reason VARCHAR(50) DEFAULT '';
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS proxy_mode VARCHAR(50) DEFAULT 'inherit';
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS proxy_provider_url VARCHAR(1000) DEFAULT '';
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS proxy_scheme_default VARCHAR(20) DEFAULT 'http';
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS assigned_proxy_url VARCHAR(500) DEFAULT '';
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS proxy_last_switched_at TIMESTAMPTZ NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS proxy_next_rotation_at TIMESTAMPTZ NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS proxy_last_switch_reason TEXT DEFAULT '';
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS proxy_last_error TEXT DEFAULT '';
 
 	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 	CREATE INDEX IF NOT EXISTS idx_accounts_platform ON accounts(platform);
@@ -260,11 +291,37 @@ func (db *DB) migrate(ctx context.Context) error {
 		test_model         VARCHAR(100) DEFAULT 'gpt-5.4',
 		test_concurrency   INT DEFAULT 50,
 		proxy_url          VARCHAR(500) DEFAULT '',
+		proxy_mode         VARCHAR(50) DEFAULT 'none',
+		proxy_provider_url VARCHAR(1000) DEFAULT '',
+		proxy_scheme_default VARCHAR(20) DEFAULT 'http',
+		auto_assign_proxy_if_missing BOOLEAN DEFAULT TRUE,
+		switch_proxy_on_network_error BOOLEAN DEFAULT TRUE,
+		proxy_rotation_hours INT DEFAULT 24,
+		disable_proxy_during_import BOOLEAN DEFAULT TRUE,
 		pg_max_conns       INT DEFAULT 50,
 		redis_pool_size    INT DEFAULT 30,
 		auto_clean_unauthorized BOOLEAN DEFAULT FALSE,
-		auto_clean_rate_limited BOOLEAN DEFAULT FALSE
+		auto_clean_rate_limited BOOLEAN DEFAULT FALSE,
+		refresh_scan_enabled BOOLEAN DEFAULT TRUE,
+		refresh_scan_interval_seconds INT DEFAULT 120,
+		refresh_pre_expire_seconds INT DEFAULT 300,
+		refresh_max_concurrency INT DEFAULT 10,
+		refresh_on_import_enabled BOOLEAN DEFAULT TRUE,
+		refresh_on_import_concurrency INT DEFAULT 10,
+		usage_probe_enabled BOOLEAN DEFAULT TRUE,
+		usage_probe_stale_after_seconds INT DEFAULT 600,
+		usage_probe_max_concurrency INT DEFAULT 4,
+		recovery_probe_enabled BOOLEAN DEFAULT TRUE,
+		recovery_probe_min_interval_seconds INT DEFAULT 1800,
+		recovery_probe_max_concurrency INT DEFAULT 2
 	);
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_mode VARCHAR(50) DEFAULT 'none';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_provider_url VARCHAR(1000) DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_scheme_default VARCHAR(20) DEFAULT 'http';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_assign_proxy_if_missing BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS switch_proxy_on_network_error BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_rotation_hours INT DEFAULT 24;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS disable_proxy_during_import BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_unauthorized BOOLEAN DEFAULT FALSE;
@@ -274,6 +331,18 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_pool_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_scheduler_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 2;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS refresh_scan_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS refresh_scan_interval_seconds INT DEFAULT 120;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS refresh_pre_expire_seconds INT DEFAULT 300;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS refresh_max_concurrency INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS refresh_on_import_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS refresh_on_import_concurrency INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_stale_after_seconds INT DEFAULT 600;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_max_concurrency INT DEFAULT 4;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_min_interval_seconds INT DEFAULT 1800;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_max_concurrency INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_error BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_expired BOOLEAN DEFAULT FALSE;
@@ -341,11 +410,23 @@ func (db *DB) migrate(ctx context.Context) error {
 
 	CREATE TABLE IF NOT EXISTS proxies (
 		id         SERIAL PRIMARY KEY,
-		url        VARCHAR(500) NOT NULL UNIQUE,
+		url        VARCHAR(500) DEFAULT '',
 		label      VARCHAR(255) DEFAULT '',
 		enabled    BOOLEAN DEFAULT TRUE,
+		source_type VARCHAR(50) DEFAULT 'static',
+		provider_url VARCHAR(1000) DEFAULT '',
+		scheme_default VARCHAR(20) DEFAULT 'http',
+		last_resolved_proxy_url VARCHAR(500) DEFAULT '',
+		last_resolved_at TIMESTAMPTZ NULL,
+		last_error TEXT DEFAULT '',
 		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
+	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS source_type VARCHAR(50) DEFAULT 'static';
+	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS provider_url VARCHAR(1000) DEFAULT '';
+	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS scheme_default VARCHAR(20) DEFAULT 'http';
+	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS last_resolved_proxy_url VARCHAR(500) DEFAULT '';
+	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS last_resolved_at TIMESTAMPTZ NULL;
+	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS last_error TEXT DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_ip VARCHAR(100) DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_location VARCHAR(255) DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_latency_ms INT DEFAULT 0;
@@ -440,48 +521,83 @@ func (db *DB) InsertAPIKey(ctx context.Context, name, key string) (int64, error)
 
 // SystemSettings 运行时设置项
 type SystemSettings struct {
-	MaxConcurrency         int
-	GlobalRPM              int
-	TestModel              string
-	TestConcurrency        int
-	ProxyURL               string
-	PgMaxConns             int
-	RedisPoolSize          int
-	AutoCleanUnauthorized  bool
-	AutoCleanRateLimited   bool
-	AdminSecret            string
-	AutoCleanFullUsage     bool
-	AutoCleanError         bool
-	AutoCleanExpired       bool
-	ProxyPoolEnabled       bool
-	FastSchedulerEnabled   bool
-	MaxRetries             int
-	AllowRemoteMigration   bool
-	ModelMapping           string // JSON: {"anthropic_model": "codex_model", ...}
-	CPASyncEnabled         bool
-	CPABaseURL             string
-	CPAAdminKey            string
-	CPAMinAccounts         int
-	CPAMaxAccounts         int
-	CPAMaxUploadsPerHour   int
-	CPASwitchAfterUploads  int
-	CPASyncIntervalSeconds int
-	MihomoBaseURL          string
-	MihomoSecret           string
-	MihomoStrategyGroup    string
-	MihomoDelayTestURL     string
-	MihomoDelayTimeoutMs   int
+	MaxConcurrency                  int
+	GlobalRPM                       int
+	TestModel                       string
+	TestConcurrency                 int
+	ProxyURL                        string
+	ProxyMode                       string
+	ProxyProviderURL                string
+	ProxySchemeDefault              string
+	AutoAssignProxyIfMissing        bool
+	SwitchProxyOnNetworkError       bool
+	ProxyRotationHours              int
+	DisableProxyDuringImport        bool
+	PgMaxConns                      int
+	RedisPoolSize                   int
+	AutoCleanUnauthorized           bool
+	AutoCleanRateLimited            bool
+	AdminSecret                     string
+	AutoCleanFullUsage              bool
+	AutoCleanError                  bool
+	AutoCleanExpired                bool
+	ProxyPoolEnabled                bool
+	FastSchedulerEnabled            bool
+	MaxRetries                      int
+	RefreshScanEnabled              bool
+	RefreshScanIntervalSeconds      int
+	RefreshPreExpireSeconds         int
+	RefreshMaxConcurrency           int
+	RefreshOnImportEnabled          bool
+	RefreshOnImportConcurrency      int
+	UsageProbeEnabled               bool
+	UsageProbeStaleAfterSeconds     int
+	UsageProbeMaxConcurrency        int
+	RecoveryProbeEnabled            bool
+	RecoveryProbeMinIntervalSeconds int
+	RecoveryProbeMaxConcurrency     int
+	AllowRemoteMigration            bool
+	ModelMapping                    string // JSON: {"anthropic_model": "codex_model", ...}
+	CPASyncEnabled                  bool
+	CPABaseURL                      string
+	CPAAdminKey                     string
+	CPAMinAccounts                  int
+	CPAMaxAccounts                  int
+	CPAMaxUploadsPerHour            int
+	CPASwitchAfterUploads           int
+	CPASyncIntervalSeconds          int
+	MihomoBaseURL                   string
+	MihomoSecret                    string
+	MihomoStrategyGroup             string
+	MihomoDelayTestURL              string
+	MihomoDelayTimeoutMs            int
 }
 
-// GetSystemSettings 加载全局设置
+// GetSystemSettings ?????????
 func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s := &SystemSettings{}
 	err := db.conn.QueryRowContext(ctx, `
-		SELECT max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
+		SELECT max_concurrency, global_rpm, test_model, test_concurrency, proxy_url,
+		       COALESCE(proxy_mode, 'none'), COALESCE(proxy_provider_url, ''), COALESCE(proxy_scheme_default, 'http'),
+		       COALESCE(auto_assign_proxy_if_missing, true), COALESCE(switch_proxy_on_network_error, true),
+		       COALESCE(proxy_rotation_hours, 24), COALESCE(disable_proxy_during_import, true),
+		       pg_max_conns, redis_pool_size,
 		       auto_clean_unauthorized, auto_clean_rate_limited, COALESCE(admin_secret, ''), COALESCE(auto_clean_full_usage, false),
 		       COALESCE(proxy_pool_enabled, false),
 		       COALESCE(fast_scheduler_enabled, false),
 		       COALESCE(max_retries, 2),
+		       COALESCE(refresh_scan_enabled, true),
+		       COALESCE(refresh_scan_interval_seconds, 120),
+		       COALESCE(refresh_pre_expire_seconds, 300),
+		       COALESCE(refresh_max_concurrency, 10),
+		       COALESCE(refresh_on_import_enabled, true),
+		       COALESCE(refresh_on_import_concurrency, 10),
+		       COALESCE(usage_probe_enabled, true),
+		       COALESCE(usage_probe_stale_after_seconds, 600),
+		       COALESCE(usage_probe_max_concurrency, 4),
+		       COALESCE(recovery_probe_enabled, true),
+		       COALESCE(recovery_probe_min_interval_seconds, 1800),
+		       COALESCE(recovery_probe_max_concurrency, 2),
 		       COALESCE(allow_remote_migration, false),
 		       COALESCE(auto_clean_error, false),
 		       COALESCE(auto_clean_expired, false),
@@ -501,9 +617,17 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(mihomo_delay_timeout_ms, 5000)
 		FROM system_settings WHERE id = 1
 	`).Scan(
-		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
+		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL,
+		&s.ProxyMode, &s.ProxyProviderURL, &s.ProxySchemeDefault,
+		&s.AutoAssignProxyIfMissing, &s.SwitchProxyOnNetworkError, &s.ProxyRotationHours, &s.DisableProxyDuringImport,
+		&s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
-		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.AllowRemoteMigration,
+		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries,
+		&s.RefreshScanEnabled, &s.RefreshScanIntervalSeconds, &s.RefreshPreExpireSeconds, &s.RefreshMaxConcurrency,
+		&s.RefreshOnImportEnabled, &s.RefreshOnImportConcurrency,
+		&s.UsageProbeEnabled, &s.UsageProbeStaleAfterSeconds, &s.UsageProbeMaxConcurrency,
+		&s.RecoveryProbeEnabled, &s.RecoveryProbeMinIntervalSeconds, &s.RecoveryProbeMaxConcurrency,
+		&s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.ModelMapping,
 		&s.CPASyncEnabled, &s.CPABaseURL, &s.CPAAdminKey, &s.CPAMinAccounts, &s.CPAMaxAccounts,
 		&s.CPAMaxUploadsPerHour, &s.CPASwitchAfterUploads, &s.CPASyncIntervalSeconds, &s.MihomoBaseURL, &s.MihomoSecret,
@@ -515,54 +639,91 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	return s, err
 }
 
-// UpdateSystemSettings 更新全局设置（upsert：无行时自动插入）
+// UpdateSystemSettings ???????????psert??????????????
 func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error {
 	_, err := db.conn.ExecContext(ctx, `
 		INSERT INTO system_settings (
-			id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
+			id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url,
+			proxy_mode, proxy_provider_url, proxy_scheme_default, auto_assign_proxy_if_missing,
+			switch_proxy_on_network_error, proxy_rotation_hours, disable_proxy_during_import,
+			pg_max_conns, redis_pool_size,
 			auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
-			fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping,
+			fast_scheduler_enabled, max_retries,
+			refresh_scan_enabled, refresh_scan_interval_seconds, refresh_pre_expire_seconds, refresh_max_concurrency,
+			refresh_on_import_enabled, refresh_on_import_concurrency,
+			usage_probe_enabled, usage_probe_stale_after_seconds, usage_probe_max_concurrency,
+			recovery_probe_enabled, recovery_probe_min_interval_seconds, recovery_probe_max_concurrency,
+			allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping,
 			cpa_sync_enabled, cpa_base_url, cpa_admin_key, cpa_min_accounts, cpa_max_accounts,
 			cpa_max_uploads_per_hour, cpa_switch_after_uploads, cpa_sync_interval_seconds, mihomo_base_url, mihomo_secret,
 			mihomo_strategy_group, mihomo_delay_test_url, mihomo_delay_timeout_ms
 		)
-		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-		        $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
+		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+		        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25,
+		        $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38,
+		        $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50)
 		ON CONFLICT (id) DO UPDATE SET
-			max_concurrency         = EXCLUDED.max_concurrency,
-			global_rpm              = EXCLUDED.global_rpm,
-			test_model              = EXCLUDED.test_model,
-			test_concurrency        = EXCLUDED.test_concurrency,
-			proxy_url               = EXCLUDED.proxy_url,
-			pg_max_conns            = EXCLUDED.pg_max_conns,
-			redis_pool_size         = EXCLUDED.redis_pool_size,
+			max_concurrency = EXCLUDED.max_concurrency,
+			global_rpm = EXCLUDED.global_rpm,
+			test_model = EXCLUDED.test_model,
+			test_concurrency = EXCLUDED.test_concurrency,
+			proxy_url = EXCLUDED.proxy_url,
+			proxy_mode = EXCLUDED.proxy_mode,
+			proxy_provider_url = EXCLUDED.proxy_provider_url,
+			proxy_scheme_default = EXCLUDED.proxy_scheme_default,
+			auto_assign_proxy_if_missing = EXCLUDED.auto_assign_proxy_if_missing,
+			switch_proxy_on_network_error = EXCLUDED.switch_proxy_on_network_error,
+			proxy_rotation_hours = EXCLUDED.proxy_rotation_hours,
+			disable_proxy_during_import = EXCLUDED.disable_proxy_during_import,
+			pg_max_conns = EXCLUDED.pg_max_conns,
+			redis_pool_size = EXCLUDED.redis_pool_size,
 			auto_clean_unauthorized = EXCLUDED.auto_clean_unauthorized,
 			auto_clean_rate_limited = EXCLUDED.auto_clean_rate_limited,
-			admin_secret            = EXCLUDED.admin_secret,
-			auto_clean_full_usage   = EXCLUDED.auto_clean_full_usage,
-			proxy_pool_enabled      = EXCLUDED.proxy_pool_enabled,
-			fast_scheduler_enabled  = EXCLUDED.fast_scheduler_enabled,
-			max_retries             = EXCLUDED.max_retries,
-			allow_remote_migration  = EXCLUDED.allow_remote_migration,
-			auto_clean_error        = EXCLUDED.auto_clean_error,
-			auto_clean_expired      = EXCLUDED.auto_clean_expired,
-			model_mapping           = EXCLUDED.model_mapping,
-			cpa_sync_enabled        = EXCLUDED.cpa_sync_enabled,
-			cpa_base_url            = EXCLUDED.cpa_base_url,
-			cpa_admin_key           = EXCLUDED.cpa_admin_key,
-			cpa_min_accounts        = EXCLUDED.cpa_min_accounts,
-			cpa_max_accounts        = EXCLUDED.cpa_max_accounts,
+			admin_secret = EXCLUDED.admin_secret,
+			auto_clean_full_usage = EXCLUDED.auto_clean_full_usage,
+			proxy_pool_enabled = EXCLUDED.proxy_pool_enabled,
+			fast_scheduler_enabled = EXCLUDED.fast_scheduler_enabled,
+			max_retries = EXCLUDED.max_retries,
+			refresh_scan_enabled = EXCLUDED.refresh_scan_enabled,
+			refresh_scan_interval_seconds = EXCLUDED.refresh_scan_interval_seconds,
+			refresh_pre_expire_seconds = EXCLUDED.refresh_pre_expire_seconds,
+			refresh_max_concurrency = EXCLUDED.refresh_max_concurrency,
+			refresh_on_import_enabled = EXCLUDED.refresh_on_import_enabled,
+			refresh_on_import_concurrency = EXCLUDED.refresh_on_import_concurrency,
+			usage_probe_enabled = EXCLUDED.usage_probe_enabled,
+			usage_probe_stale_after_seconds = EXCLUDED.usage_probe_stale_after_seconds,
+			usage_probe_max_concurrency = EXCLUDED.usage_probe_max_concurrency,
+			recovery_probe_enabled = EXCLUDED.recovery_probe_enabled,
+			recovery_probe_min_interval_seconds = EXCLUDED.recovery_probe_min_interval_seconds,
+			recovery_probe_max_concurrency = EXCLUDED.recovery_probe_max_concurrency,
+			allow_remote_migration = EXCLUDED.allow_remote_migration,
+			auto_clean_error = EXCLUDED.auto_clean_error,
+			auto_clean_expired = EXCLUDED.auto_clean_expired,
+			model_mapping = EXCLUDED.model_mapping,
+			cpa_sync_enabled = EXCLUDED.cpa_sync_enabled,
+			cpa_base_url = EXCLUDED.cpa_base_url,
+			cpa_admin_key = EXCLUDED.cpa_admin_key,
+			cpa_min_accounts = EXCLUDED.cpa_min_accounts,
+			cpa_max_accounts = EXCLUDED.cpa_max_accounts,
 			cpa_max_uploads_per_hour = EXCLUDED.cpa_max_uploads_per_hour,
 			cpa_switch_after_uploads = EXCLUDED.cpa_switch_after_uploads,
 			cpa_sync_interval_seconds = EXCLUDED.cpa_sync_interval_seconds,
-			mihomo_base_url         = EXCLUDED.mihomo_base_url,
-			mihomo_secret           = EXCLUDED.mihomo_secret,
-			mihomo_strategy_group   = EXCLUDED.mihomo_strategy_group,
-			mihomo_delay_test_url   = EXCLUDED.mihomo_delay_test_url,
+			mihomo_base_url = EXCLUDED.mihomo_base_url,
+			mihomo_secret = EXCLUDED.mihomo_secret,
+			mihomo_strategy_group = EXCLUDED.mihomo_strategy_group,
+			mihomo_delay_test_url = EXCLUDED.mihomo_delay_test_url,
 			mihomo_delay_timeout_ms = EXCLUDED.mihomo_delay_timeout_ms
-	`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
+	`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL,
+		s.ProxyMode, s.ProxyProviderURL, s.ProxySchemeDefault, s.AutoAssignProxyIfMissing,
+		s.SwitchProxyOnNetworkError, s.ProxyRotationHours, s.DisableProxyDuringImport,
+		s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
-		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
+		s.FastSchedulerEnabled, s.MaxRetries,
+		s.RefreshScanEnabled, s.RefreshScanIntervalSeconds, s.RefreshPreExpireSeconds, s.RefreshMaxConcurrency,
+		s.RefreshOnImportEnabled, s.RefreshOnImportConcurrency,
+		s.UsageProbeEnabled, s.UsageProbeStaleAfterSeconds, s.UsageProbeMaxConcurrency,
+		s.RecoveryProbeEnabled, s.RecoveryProbeMinIntervalSeconds, s.RecoveryProbeMaxConcurrency,
+		s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
 		s.CPASyncEnabled, s.CPABaseURL, s.CPAAdminKey, s.CPAMinAccounts, s.CPAMaxAccounts,
 		s.CPAMaxUploadsPerHour, s.CPASwitchAfterUploads, s.CPASyncIntervalSeconds, s.MihomoBaseURL, s.MihomoSecret,
 		s.MihomoStrategyGroup, s.MihomoDelayTestURL, s.MihomoDelayTimeoutMs)
@@ -598,19 +759,25 @@ func (db *DB) GetAllAPIKeyValues(ctx context.Context) ([]string, error) {
 
 // ProxyRow 代理行
 type ProxyRow struct {
-	ID            int64     `json:"id"`
-	URL           string    `json:"url"`
-	Label         string    `json:"label"`
-	Enabled       bool      `json:"enabled"`
-	CreatedAt     time.Time `json:"created_at"`
-	TestIP        string    `json:"test_ip"`
-	TestLocation  string    `json:"test_location"`
-	TestLatencyMs int       `json:"test_latency_ms"`
+	ID                   int64     `json:"id"`
+	URL                  string    `json:"url"`
+	Label                string    `json:"label"`
+	Enabled              bool      `json:"enabled"`
+	SourceType           string    `json:"source_type"`
+	ProviderURL          string    `json:"provider_url"`
+	SchemeDefault        string    `json:"scheme_default"`
+	LastResolvedProxyURL string    `json:"last_resolved_proxy_url"`
+	LastResolvedAt       time.Time `json:"last_resolved_at"`
+	LastError            string    `json:"last_error"`
+	CreatedAt            time.Time `json:"created_at"`
+	TestIP               string    `json:"test_ip"`
+	TestLocation         string    `json:"test_location"`
+	TestLatencyMs        int       `json:"test_latency_ms"`
 }
 
 // ListProxies 获取所有代理
 func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies ORDER BY id`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT id, url, label, enabled, COALESCE(source_type,'static'), COALESCE(provider_url,''), COALESCE(scheme_default,'http'), COALESCE(last_resolved_proxy_url,''), last_resolved_at, COALESCE(last_error,''), created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -620,12 +787,16 @@ func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
 	for rows.Next() {
 		p := &ProxyRow{}
 		var createdAtRaw interface{}
-		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs); err != nil {
+		var lastResolvedAtRaw interface{}
+		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &p.SourceType, &p.ProviderURL, &p.SchemeDefault, &p.LastResolvedProxyURL, &lastResolvedAtRaw, &p.LastError, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs); err != nil {
 			return nil, err
 		}
 		p.CreatedAt, err = parseDBTimeValue(createdAtRaw)
 		if err != nil {
 			return nil, err
+		}
+		if ts, parseErr := parseDBNullTimeValue(lastResolvedAtRaw); parseErr == nil && ts.Valid {
+			p.LastResolvedAt = ts.Time
 		}
 		proxies = append(proxies, p)
 	}
@@ -634,9 +805,9 @@ func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
 
 // ListEnabledProxies 获取已启用的代理
 func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
-	query := `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies WHERE enabled = true ORDER BY id`
+	query := `SELECT id, url, label, enabled, COALESCE(source_type,'static'), COALESCE(provider_url,''), COALESCE(scheme_default,'http'), COALESCE(last_resolved_proxy_url,''), last_resolved_at, COALESCE(last_error,''), created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies WHERE enabled = true ORDER BY id`
 	if db.isSQLite() {
-		query = `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies WHERE enabled = 1 ORDER BY id`
+		query = `SELECT id, url, label, enabled, COALESCE(source_type,'static'), COALESCE(provider_url,''), COALESCE(scheme_default,'http'), COALESCE(last_resolved_proxy_url,''), last_resolved_at, COALESCE(last_error,''), created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies WHERE enabled = 1 ORDER BY id`
 	}
 	rows, err := db.conn.QueryContext(ctx, query)
 	if err != nil {
@@ -648,12 +819,16 @@ func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
 	for rows.Next() {
 		p := &ProxyRow{}
 		var createdAtRaw interface{}
-		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs); err != nil {
+		var lastResolvedAtRaw interface{}
+		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &p.SourceType, &p.ProviderURL, &p.SchemeDefault, &p.LastResolvedProxyURL, &lastResolvedAtRaw, &p.LastError, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs); err != nil {
 			return nil, err
 		}
 		p.CreatedAt, err = parseDBTimeValue(createdAtRaw)
 		if err != nil {
 			return nil, err
+		}
+		if ts, parseErr := parseDBNullTimeValue(lastResolvedAtRaw); parseErr == nil && ts.Valid {
+			p.LastResolvedAt = ts.Time
 		}
 		proxies = append(proxies, p)
 	}
@@ -662,10 +837,31 @@ func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
 
 // InsertProxy 插入单个代理
 func (db *DB) InsertProxy(ctx context.Context, url, label string) (int64, error) {
+	return db.InsertProxyWithConfig(ctx, ProxyConfigInput{Mode: "static", URL: url}, label)
+}
+
+func (db *DB) InsertProxyWithConfig(ctx context.Context, cfg ProxyConfigInput, label string) (int64, error) {
+	sourceType := strings.TrimSpace(cfg.Mode)
+	if sourceType == "" {
+		sourceType = "static"
+	}
+	urlValue := strings.TrimSpace(cfg.URL)
+	providerURL := strings.TrimSpace(cfg.ProviderURL)
+	if sourceType == "dynamic" {
+		if urlValue == "" {
+			urlValue = providerURL
+		}
+	} else if providerURL == "" {
+		providerURL = ""
+	}
+	scheme := strings.TrimSpace(cfg.Scheme)
+	if scheme == "" {
+		scheme = "http"
+	}
 	return db.insertRowID(ctx,
-		`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT (url) DO NOTHING RETURNING id`,
-		`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT(url) DO NOTHING`,
-		url, label,
+		`INSERT INTO proxies (url, label, source_type, provider_url, scheme_default) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (url) DO NOTHING RETURNING id`,
+		`INSERT INTO proxies (url, label, source_type, provider_url, scheme_default) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(url) DO NOTHING`,
+		urlValue, label, sourceType, providerURL, scheme,
 	)
 }
 
@@ -673,21 +869,7 @@ func (db *DB) InsertProxy(ctx context.Context, url, label string) (int64, error)
 func (db *DB) InsertProxies(ctx context.Context, urls []string, label string) (int, error) {
 	inserted := 0
 	for _, u := range urls {
-		if db.isSQLite() {
-			res, err := db.conn.ExecContext(ctx, `INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT(url) DO NOTHING`, u, label)
-			if err != nil {
-				continue
-			}
-			affected, _ := res.RowsAffected()
-			if affected > 0 {
-				inserted++
-			}
-			continue
-		}
-		var id int64
-		err := db.conn.QueryRowContext(ctx,
-			`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT (url) DO NOTHING RETURNING id`, u, label).Scan(&id)
-		if err == nil {
+		if _, err := db.InsertProxyWithConfig(ctx, ProxyConfigInput{Mode: "static", URL: u}, label); err == nil {
 			inserted++
 		}
 	}
@@ -696,8 +878,14 @@ func (db *DB) InsertProxies(ctx context.Context, urls []string, label string) (i
 
 // DeleteProxy 删除单个代理
 func (db *DB) DeleteProxy(ctx context.Context, id int64) error {
-	_, err := db.conn.ExecContext(ctx, `DELETE FROM proxies WHERE id = $1`, id)
-	return err
+	res, err := db.conn.ExecContext(ctx, `DELETE FROM proxies WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // DeleteProxies 批量删除代理
@@ -723,14 +911,62 @@ func (db *DB) DeleteProxies(ctx context.Context, ids []int64) (int, error) {
 
 // UpdateProxy 更新代理
 func (db *DB) UpdateProxy(ctx context.Context, id int64, label *string, enabled *bool) error {
+	return db.UpdateProxyWithConfig(ctx, id, label, enabled, nil, nil, nil, nil)
+}
+
+func (db *DB) UpdateProxyWithConfig(ctx context.Context, id int64, label *string, enabled *bool, sourceType *string, providerURL *string, schemeDefault *string, urlValue *string) error {
 	if label != nil {
-		if _, err := db.conn.ExecContext(ctx, `UPDATE proxies SET label = $1 WHERE id = $2`, *label, id); err != nil {
+		res, err := db.conn.ExecContext(ctx, `UPDATE proxies SET label = $1 WHERE id = $2`, *label, id)
+		if err != nil {
 			return err
+		}
+		if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected == 0 {
+			return sql.ErrNoRows
 		}
 	}
 	if enabled != nil {
-		if _, err := db.conn.ExecContext(ctx, `UPDATE proxies SET enabled = $1 WHERE id = $2`, *enabled, id); err != nil {
+		res, err := db.conn.ExecContext(ctx, `UPDATE proxies SET enabled = $1 WHERE id = $2`, *enabled, id)
+		if err != nil {
 			return err
+		}
+		if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected == 0 {
+			return sql.ErrNoRows
+		}
+	}
+	if sourceType != nil {
+		res, err := db.conn.ExecContext(ctx, `UPDATE proxies SET source_type = $1 WHERE id = $2`, *sourceType, id)
+		if err != nil {
+			return err
+		}
+		if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected == 0 {
+			return sql.ErrNoRows
+		}
+	}
+	if providerURL != nil {
+		res, err := db.conn.ExecContext(ctx, `UPDATE proxies SET provider_url = $1 WHERE id = $2`, *providerURL, id)
+		if err != nil {
+			return err
+		}
+		if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected == 0 {
+			return sql.ErrNoRows
+		}
+	}
+	if schemeDefault != nil {
+		res, err := db.conn.ExecContext(ctx, `UPDATE proxies SET scheme_default = $1 WHERE id = $2`, *schemeDefault, id)
+		if err != nil {
+			return err
+		}
+		if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected == 0 {
+			return sql.ErrNoRows
+		}
+	}
+	if urlValue != nil {
+		res, err := db.conn.ExecContext(ctx, `UPDATE proxies SET url = $1 WHERE id = $2`, *urlValue, id)
+		if err != nil {
+			return err
+		}
+		if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected == 0 {
+			return sql.ErrNoRows
 		}
 	}
 	return nil
@@ -741,6 +977,13 @@ func (db *DB) UpdateProxyTestResult(ctx context.Context, id int64, ip, location 
 	_, err := db.conn.ExecContext(ctx,
 		`UPDATE proxies SET test_ip = $1, test_location = $2, test_latency_ms = $3 WHERE id = $4`,
 		ip, location, latencyMs, id)
+	return err
+}
+
+func (db *DB) UpdateProxyResolution(ctx context.Context, id int64, resolvedURL string, resolvedAt time.Time, lastError string) error {
+	_, err := db.conn.ExecContext(ctx,
+		`UPDATE proxies SET last_resolved_proxy_url = $1, last_resolved_at = $2, last_error = $3 WHERE id = $4`,
+		resolvedURL, resolvedAt, lastError, id)
 	return err
 }
 
@@ -1551,7 +1794,11 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 // ListActive 获取所有状态为 active 的账号
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url,
+		       COALESCE(proxy_mode, 'inherit'), COALESCE(proxy_provider_url, ''), COALESCE(proxy_scheme_default, 'http'),
+		       COALESCE(assigned_proxy_url, ''), proxy_last_switched_at, proxy_next_rotation_at,
+		       COALESCE(proxy_last_switch_reason, ''), COALESCE(proxy_last_error, ''),
+		       status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), created_at, updated_at
 		FROM accounts
 		WHERE status = 'active'
 		ORDER BY id
@@ -1567,6 +1814,8 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		a := &AccountRow{}
 		var credRaw interface{}
 		var cooldownUntilRaw interface{}
+		var proxyLastSwitchedRaw interface{}
+		var proxyNextRotationRaw interface{}
 		var createdAtRaw interface{}
 		var updatedAtRaw interface{}
 		if err := rows.Scan(
@@ -1576,6 +1825,14 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			&a.Type,
 			&credRaw,
 			&a.ProxyURL,
+			&a.ProxyMode,
+			&a.ProxyProviderURL,
+			&a.ProxySchemeDefault,
+			&a.AssignedProxyURL,
+			&proxyLastSwitchedRaw,
+			&proxyNextRotationRaw,
+			&a.ProxyLastSwitchReason,
+			&a.ProxyLastError,
 			&a.Status,
 			&a.CooldownReason,
 			&cooldownUntilRaw,
@@ -1587,6 +1844,12 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			return nil, fmt.Errorf("扫描账号行失败: %w", err)
 		}
 		a.Credentials = decodeCredentials(credRaw)
+		if ts, parseErr := parseDBNullTimeValue(proxyLastSwitchedRaw); parseErr == nil && ts.Valid {
+			a.ProxyLastSwitchedAt = ts.Time
+		}
+		if ts, parseErr := parseDBNullTimeValue(proxyNextRotationRaw); parseErr == nil && ts.Valid {
+			a.ProxyNextRotationAt = ts.Time
+		}
 		a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
 		if err != nil {
 			return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
@@ -1607,7 +1870,11 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 // ListAllAccounts returns all accounts for reconciliation and background maintenance flows.
 func (db *DB) ListAllAccounts(ctx context.Context) ([]*AccountRow, error) {
 	rows, err := db.conn.QueryContext(ctx, `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url,
+		       COALESCE(proxy_mode, 'inherit'), COALESCE(proxy_provider_url, ''), COALESCE(proxy_scheme_default, 'http'),
+		       COALESCE(assigned_proxy_url, ''), proxy_last_switched_at, proxy_next_rotation_at,
+		       COALESCE(proxy_last_switch_reason, ''), COALESCE(proxy_last_error, ''),
+		       status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), created_at, updated_at
 		FROM accounts
 		ORDER BY id
 	`)
@@ -1621,6 +1888,8 @@ func (db *DB) ListAllAccounts(ctx context.Context) ([]*AccountRow, error) {
 		a := &AccountRow{}
 		var credRaw interface{}
 		var cooldownUntilRaw interface{}
+		var proxyLastSwitchedRaw interface{}
+		var proxyNextRotationRaw interface{}
 		var createdAtRaw interface{}
 		var updatedAtRaw interface{}
 		if err := rows.Scan(
@@ -1630,6 +1899,14 @@ func (db *DB) ListAllAccounts(ctx context.Context) ([]*AccountRow, error) {
 			&a.Type,
 			&credRaw,
 			&a.ProxyURL,
+			&a.ProxyMode,
+			&a.ProxyProviderURL,
+			&a.ProxySchemeDefault,
+			&a.AssignedProxyURL,
+			&proxyLastSwitchedRaw,
+			&proxyNextRotationRaw,
+			&a.ProxyLastSwitchReason,
+			&a.ProxyLastError,
 			&a.Status,
 			&a.CooldownReason,
 			&cooldownUntilRaw,
@@ -1641,6 +1918,12 @@ func (db *DB) ListAllAccounts(ctx context.Context) ([]*AccountRow, error) {
 			return nil, fmt.Errorf("scan account failed: %w", err)
 		}
 		a.Credentials = decodeCredentials(credRaw)
+		if ts, parseErr := parseDBNullTimeValue(proxyLastSwitchedRaw); parseErr == nil && ts.Valid {
+			a.ProxyLastSwitchedAt = ts.Time
+		}
+		if ts, parseErr := parseDBNullTimeValue(proxyNextRotationRaw); parseErr == nil && ts.Valid {
+			a.ProxyNextRotationAt = ts.Time
+		}
 		a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
 		if err != nil {
 			return nil, fmt.Errorf("parse cooldown_until failed: %w", err)
@@ -1660,8 +1943,14 @@ func (db *DB) ListAllAccounts(ctx context.Context) ([]*AccountRow, error) {
 
 // SetAccountLocked 设置账号的锁定状态
 func (db *DB) SetAccountLocked(ctx context.Context, id int64, locked bool) error {
-	_, err := db.conn.ExecContext(ctx, `UPDATE accounts SET locked = $1 WHERE id = $2`, locked, id)
-	return err
+	res, err := db.conn.ExecContext(ctx, `UPDATE accounts SET locked = $1 WHERE id = $2`, locked, id)
+	if err != nil {
+		return err
+	}
+	if affected, err := res.RowsAffected(); err == nil && affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // UpdateCredentials 原子合并更新账号的 credentials（JSONB || 运算符，不覆盖已有字段）
@@ -1722,8 +2011,14 @@ func (db *DB) UpdateUsageSnapshotFull(ctx context.Context, id int64, pct7d float
 // SetError 标记账号错误状态
 func (db *DB) SetError(ctx context.Context, id int64, errorMsg string) error {
 	query := `UPDATE accounts SET status = 'error', error_message = $1, cooldown_reason = '', cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
-	_, err := db.conn.ExecContext(ctx, query, errorMsg, id)
-	return err
+	res, err := db.conn.ExecContext(ctx, query, errorMsg, id)
+	if err != nil {
+		return err
+	}
+	if affected, err := res.RowsAffected(); err == nil && affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // BatchSetError 批量标记账号错误状态，分批执行避免 SQL 参数过多
@@ -1812,8 +2107,27 @@ func (db *DB) ClearCooldown(ctx context.Context, id int64) error {
 	return err
 }
 
+func (db *DB) UpdateAccountProxyRuntime(ctx context.Context, id int64, assignedURL string, switchedAt, rotateAt time.Time, reason, lastError string) error {
+	_, err := db.conn.ExecContext(ctx,
+		`UPDATE accounts
+		 SET assigned_proxy_url = $1,
+		     proxy_last_switched_at = $2,
+		     proxy_next_rotation_at = $3,
+		     proxy_last_switch_reason = $4,
+		     proxy_last_error = $5,
+		     updated_at = CURRENT_TIMESTAMP
+		 WHERE id = $6`,
+		assignedURL, nullTimeArg(switchedAt), nullTimeArg(rotateAt), reason, lastError, id,
+	)
+	return err
+}
+
 // InsertAccount 插入新账号
 func (db *DB) InsertAccount(ctx context.Context, name string, refreshToken string, proxyURL string) (int64, error) {
+	return db.InsertAccountWithProxyConfig(ctx, name, refreshToken, ProxyConfigInput{URL: proxyURL})
+}
+
+func (db *DB) InsertAccountWithProxyConfig(ctx context.Context, name string, refreshToken string, cfg ProxyConfigInput) (int64, error) {
 	credentials := map[string]interface{}{
 		"refresh_token": refreshToken,
 	}
@@ -1821,11 +2135,24 @@ func (db *DB) InsertAccount(ctx context.Context, name string, refreshToken strin
 	if err != nil {
 		return 0, err
 	}
-
+	mode := strings.TrimSpace(cfg.Mode)
+	if mode == "" {
+		if strings.TrimSpace(cfg.ProviderURL) != "" {
+			mode = "dynamic"
+		} else if strings.TrimSpace(cfg.URL) != "" {
+			mode = "static"
+		} else {
+			mode = "inherit"
+		}
+	}
+	scheme := strings.TrimSpace(cfg.Scheme)
+	if scheme == "" {
+		scheme = "http"
+	}
 	return db.insertRowID(ctx,
-		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3) RETURNING id`,
-		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3)`,
-		name, credJSON, proxyURL,
+		`INSERT INTO accounts (name, credentials, proxy_url, proxy_mode, proxy_provider_url, proxy_scheme_default) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		`INSERT INTO accounts (name, credentials, proxy_url, proxy_mode, proxy_provider_url, proxy_scheme_default) VALUES ($1, $2, $3, $4, $5, $6)`,
+		name, credJSON, strings.TrimSpace(cfg.URL), mode, strings.TrimSpace(cfg.ProviderURL), scheme,
 	)
 }
 
@@ -1860,6 +2187,10 @@ func (db *DB) GetAllRefreshTokens(ctx context.Context) (map[string]bool, error) 
 
 // InsertATAccount 插入 AT-only 账号（无 refresh_token）
 func (db *DB) InsertATAccount(ctx context.Context, name string, accessToken string, proxyURL string) (int64, error) {
+	return db.InsertATAccountWithProxyConfig(ctx, name, accessToken, ProxyConfigInput{URL: proxyURL})
+}
+
+func (db *DB) InsertATAccountWithProxyConfig(ctx context.Context, name string, accessToken string, cfg ProxyConfigInput) (int64, error) {
 	credentials := map[string]interface{}{
 		"access_token": accessToken,
 	}
@@ -1867,11 +2198,24 @@ func (db *DB) InsertATAccount(ctx context.Context, name string, accessToken stri
 	if err != nil {
 		return 0, err
 	}
-
+	mode := strings.TrimSpace(cfg.Mode)
+	if mode == "" {
+		if strings.TrimSpace(cfg.ProviderURL) != "" {
+			mode = "dynamic"
+		} else if strings.TrimSpace(cfg.URL) != "" {
+			mode = "static"
+		} else {
+			mode = "inherit"
+		}
+	}
+	scheme := strings.TrimSpace(cfg.Scheme)
+	if scheme == "" {
+		scheme = "http"
+	}
 	return db.insertRowID(ctx,
-		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3) RETURNING id`,
-		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3)`,
-		name, credJSON, proxyURL,
+		`INSERT INTO accounts (name, credentials, proxy_url, proxy_mode, proxy_provider_url, proxy_scheme_default) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		`INSERT INTO accounts (name, credentials, proxy_url, proxy_mode, proxy_provider_url, proxy_scheme_default) VALUES ($1, $2, $3, $4, $5, $6)`,
+		name, credJSON, strings.TrimSpace(cfg.URL), mode, strings.TrimSpace(cfg.ProviderURL), scheme,
 	)
 }
 

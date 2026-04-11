@@ -22,6 +22,9 @@ const (
 	ClientID      = "app_EMoamEEZ73f0CkXaXp7hrann"
 	RefreshScopes = "openid profile email"
 	MaxRetries    = 3
+
+	maxTokenResponseBytes = 1 << 20 // 1MB
+	maxTokenErrorChars    = 1024
 )
 
 // TokenData 保存一次 RT 刷新获得的 token 信息
@@ -42,6 +45,10 @@ type AccountInfo struct {
 
 // RefreshAccessToken 用 RT 换取 AT
 func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL string) (*TokenData, *AccountInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	data := url.Values{
 		"grant_type":    {"refresh_token"},
 		"client_id":     {ClientID},
@@ -63,13 +70,16 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenResponseBytes+1))
 	if err != nil {
-		return nil, nil, fmt.Errorf("读取响应失败: %w", err)
+		return nil, nil, fmt.Errorf("读取 token 响应失败: %w", err)
+	}
+	if len(body) > maxTokenResponseBytes {
+		return nil, nil, fmt.Errorf("oauth 响应体过大")
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("刷新失败 (status %d): %s", resp.StatusCode, string(body))
+		return nil, nil, fmt.Errorf("刷新失败 (status %d): %s", resp.StatusCode, truncateTokenError(string(body)))
 	}
 
 	var tokenResp struct {
@@ -103,6 +113,10 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 
 // RefreshWithRetry 带重试的 RT 刷新
 func RefreshWithRetry(ctx context.Context, refreshToken string, proxyURL string) (*TokenData, *AccountInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	var lastErr error
 	for attempt := 0; attempt < MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -225,8 +239,8 @@ func ParseAccessToken(accessToken string) *AccessTokenInfo {
 	}
 
 	var claims struct {
-		Exp            int64 `json:"exp"`
-		OpenAIAuth    *struct {
+		Exp        int64 `json:"exp"`
+		OpenAIAuth *struct {
 			ChatGPTAccountID string `json:"chatgpt_account_id"`
 			PlanType         string `json:"chatgpt_plan_type"`
 		} `json:"https://api.openai.com/auth"`
@@ -265,7 +279,7 @@ func (e *authPoolEntry) touch() {
 }
 
 const (
-	authClientPoolTTL         = 5 * time.Minute
+	authClientPoolTTL             = 5 * time.Minute
 	authClientPoolCleanupInterval = 60 * time.Second
 )
 
@@ -339,8 +353,6 @@ func buildHTTPClient(proxyURL string) *http.Client {
 	return client
 }
 
-
-
 // BuildHTTPClient builds a proxy-aware HTTP client (exported for admin OAuth flow).
 func BuildHTTPClient(proxyURL string) *http.Client {
 	return buildHTTPClient(proxyURL)
@@ -358,4 +370,12 @@ func HashAccountID(accountID string) string {
 	}
 	h := sha256.Sum256([]byte(accountID))
 	return fmt.Sprintf("%x", h[:4])
+}
+
+func truncateTokenError(raw string) string {
+	value := strings.TrimSpace(raw)
+	if len(value) <= maxTokenErrorChars {
+		return value
+	}
+	return value[:maxTokenErrorChars]
 }

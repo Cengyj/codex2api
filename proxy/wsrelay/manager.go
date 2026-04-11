@@ -7,11 +7,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/proxyutil"
 	"github.com/gorilla/websocket"
 )
 
@@ -309,6 +311,7 @@ func (m *Manager) createConnection(
 	dialer := &websocket.Dialer{
 		HandshakeTimeout:  m.dialer.HandshakeTimeout,
 		EnableCompression: m.dialer.EnableCompression,
+		NetDialContext:    m.dialer.NetDialContext,
 	}
 
 	// 配置代理
@@ -325,8 +328,45 @@ func (m *Manager) createConnection(
 		if err != nil {
 			return nil, fmt.Errorf("parse proxy URL failed: %w", err)
 		}
-		dialer.Proxy = func(req *http.Request) (*url.URL, error) {
-			return proxyURLParsed, nil
+		switch strings.ToLower(strings.TrimSpace(proxyURLParsed.Scheme)) {
+		case "http", "https":
+			dialer.Proxy = func(req *http.Request) (*url.URL, error) {
+				return proxyURLParsed, nil
+			}
+		case "socks4", "socks5", "socks5h":
+			baseDialer := &net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}
+			proxyDialer, err := proxyutil.NewProxyDialer(proxyURL, baseDialer)
+			if err != nil {
+				return nil, fmt.Errorf("build proxy dialer failed: %w", err)
+			}
+			if contextAware, ok := proxyDialer.(interface {
+				DialContext(ctx context.Context, network, address string) (net.Conn, error)
+			}); ok {
+				dialer.NetDialContext = contextAware.DialContext
+			} else {
+				dialer.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+					type result struct {
+						conn net.Conn
+						err  error
+					}
+					done := make(chan result, 1)
+					go func() {
+						conn, err := proxyDialer.Dial(network, address)
+						done <- result{conn: conn, err: err}
+					}()
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case out := <-done:
+						return out.conn, out.err
+					}
+				}
+			}
+		default:
+			return nil, fmt.Errorf("unsupported proxy scheme: %s", proxyURLParsed.Scheme)
 		}
 	}
 

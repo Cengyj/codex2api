@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -146,7 +147,7 @@ func TestImportAccountsJSONReturnsExistingNoTokenMessageForUnsupportedJSON(t *te
 	ctx.Request = req
 
 	handler := &Handler{}
-	handler.importAccountsJSON(ctx, "")
+	handler.importAccountsJSON(ctx, database.ProxyConfigInput{})
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
@@ -170,7 +171,7 @@ func TestImportAccountsJSONRejectsInvalidJSONFile(t *testing.T) {
 	ctx.Request = req
 
 	handler := &Handler{}
-	handler.importAccountsJSON(ctx, "")
+	handler.importAccountsJSON(ctx, database.ProxyConfigInput{})
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)

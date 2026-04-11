@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -135,5 +136,80 @@ func TestProbeUsageSnapshotUsesEffectiveProxyURL(t *testing.T) {
 		}
 	default:
 		t.Fatal("executeRequest was not called")
+	}
+}
+
+func TestTestConnectionSanitizesRequestError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler, _, _ := newProxyTestHandler()
+	originalExecute := executeRequest
+	defer func() {
+		executeRequest = originalExecute
+	}()
+
+	executeRequest = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *proxy.DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, error) {
+		return nil, errors.New("dial tcp 1.2.3.4:443: connect: connection refused")
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts/1/test", nil)
+
+	handler.TestConnection(ctx)
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, "请求失败") {
+		t.Fatalf("body = %q, want generic request failure", body)
+	}
+	if strings.Contains(body, "dial tcp") {
+		t.Fatalf("body = %q, should not expose low-level network error", body)
+	}
+}
+
+func TestTestConnectionSanitizesUpstreamErrorBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler, _, _ := newProxyTestHandler()
+	originalExecute := executeRequest
+	defer func() {
+		executeRequest = originalExecute
+	}()
+
+	executeRequest = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *proxy.DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, error) {
+		return newHTTPResponse(http.StatusBadGateway, "sensitive upstream body"), nil
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts/1/test", nil)
+
+	handler.TestConnection(ctx)
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, "上游返回 502") {
+		t.Fatalf("body = %q, want generic upstream status", body)
+	}
+	if strings.Contains(body, "sensitive upstream body") {
+		t.Fatalf("body = %q, should not expose upstream body", body)
+	}
+}
+
+func TestSendTestEventSkipsCanceledRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	reqCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts/1/test", nil).WithContext(reqCtx)
+
+	if ok := sendTestEvent(ctx, testEvent{Type: "error", Error: "boom"}); ok {
+		t.Fatal("sendTestEvent() = true, want false for canceled request")
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("body = %q, want empty", recorder.Body.String())
 	}
 }

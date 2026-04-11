@@ -6,11 +6,7 @@ import CPASync from './pages/CPASync'
 import Dashboard from './pages/Dashboard'
 import Operations from './pages/Operations'
 import Proxies from './pages/Proxies'
-import SchedulerBoard from './pages/SchedulerBoard'
 import Settings from './pages/Settings'
-import Guide from './pages/Guide'
-import ApiReference from './pages/ApiReference'
-import Usage from './pages/Usage'
 
 export default function App() {
   return (
@@ -22,11 +18,7 @@ export default function App() {
           <Route path="/cpa-sync" element={<CPASync />} />
           <Route path="/proxies" element={<Proxies />} />
           <Route path="/ops" element={<Operations />} />
-          <Route path="/ops/scheduler" element={<SchedulerBoard />} />
-          <Route path="/usage" element={<Usage />} />
           <Route path="/settings" element={<Settings />} />
-          <Route path="/docs" element={<Guide />} />
-          <Route path="/api-reference" element={<ApiReference />} />
         </Routes>
       </Layout>
     </AuthGate>

@@ -9,14 +9,14 @@ import (
 	"strings"
 	"time"
 
-	xproxy "golang.org/x/net/proxy"
+	"github.com/codex2api/internal/proxyutil"
 )
 
 type contextDialer interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }
 
-// ConfigureTransportProxy applies HTTP(S) or SOCKS5 proxy settings to a transport.
+// ConfigureTransportProxy applies HTTP(S), SOCKS4, or SOCKS5 proxy settings to a transport.
 func ConfigureTransportProxy(transport *http.Transport, rawProxyURL string, baseDialer *net.Dialer) error {
 	if transport == nil || strings.TrimSpace(rawProxyURL) == "" {
 		return nil
@@ -35,16 +35,10 @@ func ConfigureTransportProxy(transport *http.Transport, rawProxyURL string, base
 		transport.Proxy = http.ProxyURL(u)
 		transport.DialContext = baseDialer.DialContext
 		return nil
-	case "socks5", "socks5h":
-		var auth *xproxy.Auth
-		if u.User != nil {
-			password, _ := u.User.Password()
-			auth = &xproxy.Auth{User: u.User.Username(), Password: password}
-		}
-
-		dialer, err := xproxy.SOCKS5("tcp", u.Host, auth, baseDialer)
+	case "socks4", "socks5", "socks5h":
+		dialer, err := proxyutil.NewProxyDialer(rawProxyURL, baseDialer)
 		if err != nil {
-			return fmt.Errorf("build socks5 dialer: %w", err)
+			return err
 		}
 		if cd, ok := dialer.(contextDialer); ok {
 			transport.DialContext = cd.DialContext

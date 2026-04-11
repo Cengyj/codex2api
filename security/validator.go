@@ -3,20 +3,22 @@
 package security
 
 import (
+	neturl "net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
 
 // Validation constants
 const (
-	MaxModelLength        = 100
-	MaxEmailLength        = 255
-	MaxProxyURLLength     = 500
-	MaxTokenLength        = 8192
-	MaxRequestBodySize    = 10 * 1024 * 1024 // 10MB
-	MaxHeaderSize         = 16 * 1024        // 16KB
-	AllowedModelPattern   = `^[a-zA-Z0-9._-]+$`
+	MaxModelLength         = 100
+	MaxEmailLength         = 255
+	MaxProxyURLLength      = 500
+	MaxTokenLength         = 8192
+	MaxRequestBodySize     = 10 * 1024 * 1024 // 10MB
+	MaxHeaderSize          = 16 * 1024        // 16KB
+	AllowedModelPattern    = `^[a-zA-Z0-9._-]+$`
 	AllowedEndpointPattern = `^[a-zA-Z0-9/_-]+$`
 )
 
@@ -108,12 +110,31 @@ func ValidateEmail(email string) error {
 }
 
 // ValidateProxyURL validates a proxy URL
-func ValidateProxyURL(url string) error {
-	if url == "" {
+func ValidateProxyURL(rawURL string) error {
+	if rawURL == "" {
 		return nil
 	}
-	if utf8.RuneCountInString(url) > MaxProxyURLLength {
+	if utf8.RuneCountInString(rawURL) > MaxProxyURLLength {
 		return &ValidationError{Field: "proxy_url", Message: "proxy URL too long"}
+	}
+	parsed, err := neturl.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return &ValidationError{Field: "proxy_url", Message: "invalid proxy URL"}
+	}
+	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	switch scheme {
+	case "http", "https", "socks4", "socks5", "socks5h":
+	default:
+		return &ValidationError{Field: "proxy_url", Message: "unsupported proxy URL scheme"}
+	}
+	if strings.TrimSpace(parsed.Hostname()) == "" {
+		return &ValidationError{Field: "proxy_url", Message: "proxy URL missing host"}
+	}
+	if port := strings.TrimSpace(parsed.Port()); port != "" {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber <= 0 || portNumber > 65535 {
+			return &ValidationError{Field: "proxy_url", Message: "invalid proxy URL port"}
+		}
 	}
 	return nil
 }

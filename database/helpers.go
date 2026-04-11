@@ -68,6 +68,13 @@ func parseDBTimeString(value string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("无法解析时间值: %q", value)
 }
 
+func nullTimeArg(t time.Time) interface{} {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
+
 func decodeCredentials(raw interface{}) map[string]interface{} {
 	data := bytesFromDBValue(raw)
 	if len(data) == 0 {

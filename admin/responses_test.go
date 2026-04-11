@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -80,10 +79,9 @@ func TestWriteInternalError(t *testing.T) {
 
 func TestStatsResponse(t *testing.T) {
 	resp := statsResponse{
-		Total:         10,
-		Available:     8,
-		Error:         2,
-		TodayRequests: 1000,
+		Total:     10,
+		Available: 8,
+		Error:     2,
 	}
 
 	// Verify JSON serialization includes the expected fields with correct keys
@@ -106,9 +104,6 @@ func TestStatsResponse(t *testing.T) {
 	}
 	if errorField, ok := decoded["error"]; !ok || errorField != float64(2) {
 		t.Errorf("expected JSON to contain \"error\" field = 2, got %v", errorField)
-	}
-	if todayRequests, ok := decoded["today_requests"]; !ok || todayRequests != float64(1000) {
-		t.Errorf("expected JSON to contain \"today_requests\" field = 1000, got %v", todayRequests)
 	}
 }
 
@@ -141,21 +136,6 @@ func TestCreateAccountResponse(t *testing.T) {
 	}
 }
 
-func TestCreateAPIKeyResponse(t *testing.T) {
-	resp := createAPIKeyResponse{
-		ID:   456,
-		Key:  "api-key-secret",
-		Name: "Test Key",
-	}
-
-	if resp.ID != 456 {
-		t.Errorf("ID = %d, want 456", resp.ID)
-	}
-	if resp.Key != "api-key-secret" {
-		t.Errorf("Key = %q, want 'api-key-secret'", resp.Key)
-	}
-}
-
 func TestOpsResponseTypes(t *testing.T) {
 	cpuResp := opsCPUResponse{
 		Percent: 45.5,
@@ -183,14 +163,6 @@ func TestOpsResponseTypes(t *testing.T) {
 		t.Errorf("Goroutines = %d, want 50", runtimeResp.Goroutines)
 	}
 
-	requestsResp := opsRequestsResponse{
-		Active: 5,
-		Total:  1000,
-	}
-	if requestsResp.Active != 5 {
-		t.Errorf("Active = %d, want 5", requestsResp.Active)
-	}
-
 	dbResp := opsDatabaseResponse{
 		Healthy:      true,
 		Open:         5,
@@ -216,21 +188,6 @@ func TestOpsResponseTypes(t *testing.T) {
 		t.Errorf("PoolSize = %d, want 20", redisResp.PoolSize)
 	}
 
-	trafficResp := opsTrafficResponse{
-		QPS:           10.5,
-		QPSPeak:       50.0,
-		TPS:           100.0,
-		TPSPeak:       500.0,
-		RPM:           600.0,
-		TPM:           6000.0,
-		ErrorRate:     0.01,
-		TodayRequests: 10000,
-		TodayTokens:   50000,
-		RPMLimit:      1000,
-	}
-	if trafficResp.RPMLimit != 1000 {
-		t.Errorf("RPMLimit = %d, want 1000", trafficResp.RPMLimit)
-	}
 }
 
 func TestOpsOverviewResponse(t *testing.T) {
@@ -255,10 +212,6 @@ func TestOpsOverviewResponse(t *testing.T) {
 			AvailableAccounts: 5,
 			TotalAccounts:     10,
 		},
-		Requests: opsRequestsResponse{
-			Active: 10,
-			Total:  5000,
-		},
 		Postgres: opsDatabaseResponse{
 			Healthy:      true,
 			Open:         5,
@@ -275,18 +228,6 @@ func TestOpsOverviewResponse(t *testing.T) {
 			StaleConns:   0,
 			PoolSize:     20,
 			UsagePercent: 50.0,
-		},
-		Traffic: opsTrafficResponse{
-			QPS:           5.5,
-			QPSPeak:       25.0,
-			TPS:           55.0,
-			TPSPeak:       250.0,
-			RPM:           330.0,
-			TPM:           3300.0,
-			ErrorRate:     0.005,
-			TodayRequests: 5000,
-			TodayTokens:   25000,
-			RPMLimit:      1000,
 		},
 	}
 
@@ -305,10 +246,9 @@ func TestOpsOverviewResponse(t *testing.T) {
 
 func TestStatsResponseJSON(t *testing.T) {
 	resp := statsResponse{
-		Total:         10,
-		Available:     8,
-		Error:         2,
-		TodayRequests: 1000,
+		Total:     10,
+		Available: 8,
+		Error:     2,
 	}
 
 	data, err := json.Marshal(resp)
@@ -384,31 +324,31 @@ func TestAccountsResponse(t *testing.T) {
 
 func TestAccountResponseFields(t *testing.T) {
 	resp := accountResponse{
-		ID:                      1,
-		Name:                    "Test Account",
-		Email:                   "test@example.com",
-		PlanType:                "plus",
-		Status:                  "active",
-		HealthTier:              "healthy",
-		SchedulerScore:          95.5,
-		ConcurrencyCap:          4,
-		ProxyURL:                "http://proxy:8080",
-		CreatedAt:               time.Now().Format(time.RFC3339),
-		UpdatedAt:               time.Now().Format(time.RFC3339),
-		ActiveRequests:          2,
-		TotalRequests:           100,
-		LastUsedAt:              time.Now().Format(time.RFC3339),
-		SuccessRequests:         95,
-		ErrorRequests:           5,
-		UsagePercent7d:          floatPtr(75.5),
-		UsagePercent5h:          floatPtr(50.0),
-		Reset5hAt:               time.Now().Format(time.RFC3339),
-		Reset7dAt:               time.Now().Add(7 * 24 * time.Hour).Format(time.RFC3339),
-		ScoreBreakdown:          schedulerBreakdownResponse{},
-		LastUnauthorizedAt:      time.Now().Format(time.RFC3339),
-		LastRateLimitedAt:       time.Now().Format(time.RFC3339),
-		LastTimeoutAt:           time.Now().Format(time.RFC3339),
-		LastServerErrorAt:       time.Now().Format(time.RFC3339),
+		ID:                 1,
+		Name:               "Test Account",
+		Email:              "test@example.com",
+		PlanType:           "plus",
+		Status:             "active",
+		HealthTier:         "healthy",
+		SchedulerScore:     95.5,
+		ConcurrencyCap:     4,
+		ProxyURL:           "http://proxy:8080",
+		CreatedAt:          time.Now().Format(time.RFC3339),
+		UpdatedAt:          time.Now().Format(time.RFC3339),
+		ActiveRequests:     2,
+		TotalRequests:      100,
+		LastUsedAt:         time.Now().Format(time.RFC3339),
+		SuccessRequests:    95,
+		ErrorRequests:      5,
+		UsagePercent7d:     floatPtr(75.5),
+		UsagePercent5h:     floatPtr(50.0),
+		Reset5hAt:          time.Now().Format(time.RFC3339),
+		Reset7dAt:          time.Now().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+		ScoreBreakdown:     schedulerBreakdownResponse{},
+		LastUnauthorizedAt: time.Now().Format(time.RFC3339),
+		LastRateLimitedAt:  time.Now().Format(time.RFC3339),
+		LastTimeoutAt:      time.Now().Format(time.RFC3339),
+		LastServerErrorAt:  time.Now().Format(time.RFC3339),
 	}
 
 	if resp.Name != "Test Account" {
@@ -447,79 +387,13 @@ func TestSchedulerBreakdownResponse(t *testing.T) {
 	}
 }
 
-// ==================== Usage Logs Response Tests ====================
-
-func TestUsageLogsResponse(t *testing.T) {
-	resp := usageLogsResponse{
-		Logs: []*database.UsageLog{
-			{
-				ID:           1,
-				APIKeyID:     3,
-				APIKeyName:   "Team A",
-				APIKeyMasked: "sk-a****...****1111",
-			},
-		},
-	}
-
-	data, err := json.Marshal(resp)
-	if err != nil {
-		t.Fatalf("failed to marshal usageLogsResponse: %v", err)
-	}
-	if !json.Valid(data) {
-		t.Fatalf("marshaled usageLogsResponse produced invalid JSON: %s", string(data))
-	}
-
-	var decoded struct {
-		Logs []map[string]interface{} `json:"logs"`
-	}
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("failed to unmarshal usageLogsResponse JSON: %v", err)
-	}
-	if len(decoded.Logs) != 1 {
-		t.Fatalf("len(decoded.Logs) = %d, want %d", len(decoded.Logs), 1)
-	}
-	if got := decoded.Logs[0]["api_key_id"]; got != float64(3) {
-		t.Fatalf("api_key_id = %v, want %v", got, float64(3))
-	}
-	if got := decoded.Logs[0]["api_key_name"]; got != "Team A" {
-		t.Fatalf("api_key_name = %v, want %q", got, "Team A")
-	}
-	if got := decoded.Logs[0]["api_key_masked"]; got != "sk-a****...****1111" {
-		t.Fatalf("api_key_masked = %v, want %q", got, "sk-a****...****1111")
-	}
-}
-
-// ==================== API Keys Response Tests ====================
-
-func TestAPIKeysResponse(t *testing.T) {
-	resp := apiKeysResponse{
-		Keys: nil, // Would contain actual key rows
-	}
-
-	// Verify JSON serialization includes the expected "keys" field
-	data, err := json.Marshal(resp)
-	if err != nil {
-		t.Fatalf("failed to marshal apiKeysResponse: %v", err)
-	}
-
-	var decoded map[string]interface{}
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("failed to unmarshal apiKeysResponse JSON: %v", err)
-	}
-
-	if _, ok := decoded["keys"]; !ok {
-		t.Errorf("expected JSON to contain \"keys\" field, got %v", decoded)
-	}
-}
-
 // ==================== Benchmarks ====================
 
 func BenchmarkStatsResponseMarshal(b *testing.B) {
 	resp := statsResponse{
-		Total:         100,
-		Available:     80,
-		Error:         20,
-		TodayRequests: 10000,
+		Total:     100,
+		Available: 80,
+		Error:     20,
 	}
 
 	b.ReportAllocs()

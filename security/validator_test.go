@@ -139,7 +139,7 @@ func TestValidateModelName(t *testing.T) {
 	}{
 		{"gpt-5.4", false},
 		{"gpt-5-codex", false},
-		{"", false}, // empty is allowed
+		{"", false},                      // empty is allowed
 		{strings.Repeat("a", 101), true}, // too long
 		{"model<script>", true},          // invalid chars
 	}
@@ -151,6 +151,33 @@ func TestValidateModelName(t *testing.T) {
 		}
 		if !test.isError && err != nil {
 			t.Errorf("ValidateModelName(%q) unexpected error: %v", test.input, err)
+		}
+	}
+}
+
+func TestValidateProxyURL(t *testing.T) {
+	tests := []struct {
+		input   string
+		isError bool
+	}{
+		{"", false},
+		{"http://127.0.0.1:8080", false},
+		{"https://user:pass@example.com:8443", false},
+		{"socks4://10.0.0.2:1080", false},
+		{"socks5h://proxy.example.com:1080", false},
+		{"ftp://proxy.example.com:21", true},
+		{"http://", true},
+		{"http://proxy.example.com:99999", true},
+		{"not-a-url", true},
+	}
+
+	for _, test := range tests {
+		err := ValidateProxyURL(test.input)
+		if test.isError && err == nil {
+			t.Errorf("ValidateProxyURL(%q) expected error", test.input)
+		}
+		if !test.isError && err != nil {
+			t.Errorf("ValidateProxyURL(%q) unexpected error: %v", test.input, err)
 		}
 	}
 }
@@ -179,8 +206,8 @@ func TestSecureCompare(t *testing.T) {
 
 func TestSafeTruncate(t *testing.T) {
 	tests := []struct {
-		input   string
-		maxLen  int
+		input    string
+		maxLen   int
 		expected string
 	}{
 		{"hello world", 5, "hello"},

@@ -3,14 +3,15 @@ package admin
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,21 +30,22 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	store          *auth.Store
-	cache          cache.TokenCache
-	db             *database.DB
-	rateLimiter    *proxy.RateLimiter
-	refreshAccount func(context.Context, int64) error
-	cpuSampler     *cpuSampler
-	startedAt      time.Time
-	pgMaxConns     int
-	redisPoolSize  int
-	databaseDriver string
-	databaseLabel  string
-	cacheDriver    string
-	cacheLabel     string
-	adminSecretEnv string
-	cpaSync        *CPASyncService
+	store            *auth.Store
+	cache            cache.TokenCache
+	db               *database.DB
+	rateLimiter      *proxy.RateLimiter
+	refreshAccount   func(context.Context, int64) error
+	cpuSampler       *cpuSampler
+	startedAt        time.Time
+	pgMaxConns       int
+	redisPoolSize    int
+	databaseDriver   string
+	databaseLabel    string
+	cacheDriver      string
+	cacheLabel       string
+	adminSecretEnv   string
+	adminAuthLimiter *security.IPRateLimiter
+	cpaSync          *CPASyncService
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -63,18 +65,19 @@ type chartCacheEntry struct {
 // NewHandler 创建管理后台处理器
 func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
 	handler := &Handler{
-		store:          store,
-		cache:          tc,
-		db:             db,
-		rateLimiter:    rl,
-		cpuSampler:     newCPUSampler(),
-		startedAt:      time.Now(),
-		databaseDriver: db.Driver(),
-		databaseLabel:  db.Label(),
-		cacheDriver:    tc.Driver(),
-		cacheLabel:     tc.Label(),
-		adminSecretEnv: adminSecretEnv,
-		chartCacheData: make(map[string]*chartCacheEntry),
+		store:            store,
+		cache:            tc,
+		db:               db,
+		rateLimiter:      rl,
+		cpuSampler:       newCPUSampler(),
+		startedAt:        time.Now(),
+		databaseDriver:   db.Driver(),
+		databaseLabel:    db.Label(),
+		cacheDriver:      tc.Driver(),
+		cacheLabel:       tc.Label(),
+		adminSecretEnv:   adminSecretEnv,
+		adminAuthLimiter: security.NewIPRateLimiter(20, time.Minute),
+		chartCacheData:   make(map[string]*chartCacheEntry),
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
 	return handler
@@ -103,7 +106,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
 	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
 	api.GET("/accounts/:id/test", h.TestConnection)
-	api.GET("/accounts/:id/usage", h.GetAccountUsage)
 	api.POST("/accounts/batch-test", h.BatchTest)
 	api.POST("/accounts/clean-banned", h.CleanBanned)
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
@@ -111,13 +113,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/export", h.ExportAccounts)
 	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
-	api.GET("/usage/stats", h.GetUsageStats)
-	api.GET("/usage/logs", h.GetUsageLogs)
-	api.GET("/usage/chart-data", h.GetChartData)
-	api.DELETE("/usage/logs", h.ClearUsageLogs)
-	api.GET("/keys", h.ListAPIKeys)
-	api.POST("/keys", h.CreateAPIKey)
-	api.DELETE("/keys/:id", h.DeleteAPIKey)
 	api.GET("/health", h.GetHealth)
 	api.GET("/ops/overview", h.GetOpsOverview)
 	api.GET("/settings", h.GetSettings)
@@ -146,8 +141,20 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		adminSecret, source := h.resolveAdminSecret(c.Request.Context())
 		if adminSecret == "" {
+			if source == "error" {
+				security.SecurityAuditLog("ADMIN_AUTH_ERROR", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error": "管理鉴权暂时不可用，请稍后重试",
+				})
+				c.Abort()
+				return
+			}
 			// 未配置管理密钥，跳过鉴权
-			c.Next()
+			security.SecurityAuditLog("ADMIN_AUTH_MISCONFIGURED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "????????????????",
+			})
+			c.Abort()
 			return
 		}
 
@@ -165,6 +172,14 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 
 		// 使用安全比较防止时序攻击
 		if !security.SecureCompare(adminKey, adminSecret) {
+			if h.adminAuthLimiter != nil && !h.adminAuthLimiter.Allow(c.ClientIP()) {
+				security.SecurityAuditLog("ADMIN_AUTH_RATE_LIMITED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
+				c.JSON(http.StatusTooManyRequests, gin.H{
+					"error": "管理密钥重试过于频繁，请稍后再试",
+				})
+				c.Abort()
+				return
+			}
 			// 记录安全审计日志
 			security.SecurityAuditLog("ADMIN_AUTH_FAILED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
 			c.JSON(http.StatusUnauthorized, gin.H{
@@ -191,7 +206,10 @@ func (h *Handler) resolveAdminSecret(ctx context.Context) (string, string) {
 	readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	settings, err := h.db.GetSystemSettings(readCtx)
-	if err != nil || settings == nil || settings.AdminSecret == "" {
+	if err != nil {
+		return "", "error"
+	}
+	if settings == nil || settings.AdminSecret == "" {
 		return "", "disabled"
 	}
 	return settings.AdminSecret, "database"
@@ -211,7 +229,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 
 	accounts, err := h.db.ListActive(ctx)
 	if err != nil {
-		writeInternalError(c, err)
+		writeLoggedInternalError(c, "获取统计信息失败", err)
 		return
 	}
 
@@ -224,50 +242,52 @@ func (h *Handler) GetStats(c *gin.Context) {
 		}
 	}
 
-	usageStats, _ := h.db.GetUsageStats(ctx)
-	todayReqs := int64(0)
-	if usageStats != nil {
-		todayReqs = usageStats.TodayRequests
-	}
-
 	c.JSON(http.StatusOK, statsResponse{
-		Total:         total,
-		Available:     available,
-		Error:         errCount,
-		TodayRequests: todayReqs,
+		Total:            total,
+		Available:        available,
+		Error:            errCount,
+		RefreshScheduler: h.getRefreshSchedulerResponse(),
+		RefreshConfig:    h.getRefreshConfigResponse(),
 	})
 }
 
 // ==================== Accounts ====================
 
 type accountResponse struct {
-	ID                 int64                      `json:"id"`
-	Name               string                     `json:"name"`
-	Email              string                     `json:"email"`
-	PlanType           string                     `json:"plan_type"`
-	Status             string                     `json:"status"`
-	ATOnly             bool                       `json:"at_only"`
-	HealthTier         string                     `json:"health_tier"`
-	SchedulerScore     float64                    `json:"scheduler_score"`
-	ConcurrencyCap     int64                      `json:"dynamic_concurrency_limit"`
-	ProxyURL           string                     `json:"proxy_url"`
-	CreatedAt          string                     `json:"created_at"`
-	UpdatedAt          string                     `json:"updated_at"`
-	ActiveRequests     int64                      `json:"active_requests"`
-	TotalRequests      int64                      `json:"total_requests"`
-	LastUsedAt         string                     `json:"last_used_at"`
-	SuccessRequests    int64                      `json:"success_requests"`
-	ErrorRequests      int64                      `json:"error_requests"`
-	UsagePercent7d     *float64                   `json:"usage_percent_7d"`
-	UsagePercent5h     *float64                   `json:"usage_percent_5h"`
-	Reset5hAt          string                     `json:"reset_5h_at,omitempty"`
-	Reset7dAt          string                     `json:"reset_7d_at,omitempty"`
-	ScoreBreakdown     schedulerBreakdownResponse `json:"scheduler_breakdown"`
-	LastUnauthorizedAt string                     `json:"last_unauthorized_at,omitempty"`
-	LastRateLimitedAt  string                     `json:"last_rate_limited_at,omitempty"`
-	LastTimeoutAt      string                     `json:"last_timeout_at,omitempty"`
-	LastServerErrorAt  string                     `json:"last_server_error_at,omitempty"`
-	Locked             bool                       `json:"locked"`
+	ID                  int64                      `json:"id"`
+	Name                string                     `json:"name"`
+	Email               string                     `json:"email"`
+	PlanType            string                     `json:"plan_type"`
+	Status              string                     `json:"status"`
+	ATOnly              bool                       `json:"at_only"`
+	HealthTier          string                     `json:"health_tier"`
+	SchedulerScore      float64                    `json:"scheduler_score"`
+	ConcurrencyCap      int64                      `json:"dynamic_concurrency_limit"`
+	ProxyURL            string                     `json:"proxy_url"`
+	ProxyMode           string                     `json:"proxy_mode,omitempty"`
+	ProxyProviderURL    string                     `json:"proxy_provider_url,omitempty"`
+	ProxyProtocol       string                     `json:"proxy_protocol,omitempty"`
+	ProxyAssignedURL    string                     `json:"proxy_assigned_url,omitempty"`
+	ProxyAssignedAt     string                     `json:"proxy_assigned_at,omitempty"`
+	ProxyLastSwitchedAt string                     `json:"proxy_last_switched_at,omitempty"`
+	ProxyLastError      string                     `json:"proxy_last_error,omitempty"`
+	CreatedAt           string                     `json:"created_at"`
+	UpdatedAt           string                     `json:"updated_at"`
+	ActiveRequests      int64                      `json:"active_requests"`
+	TotalRequests       int64                      `json:"total_requests"`
+	LastUsedAt          string                     `json:"last_used_at"`
+	SuccessRequests     int64                      `json:"success_requests"`
+	ErrorRequests       int64                      `json:"error_requests"`
+	UsagePercent7d      *float64                   `json:"usage_percent_7d"`
+	UsagePercent5h      *float64                   `json:"usage_percent_5h"`
+	Reset5hAt           string                     `json:"reset_5h_at,omitempty"`
+	Reset7dAt           string                     `json:"reset_7d_at,omitempty"`
+	ScoreBreakdown      schedulerBreakdownResponse `json:"scheduler_breakdown"`
+	LastUnauthorizedAt  string                     `json:"last_unauthorized_at,omitempty"`
+	LastRateLimitedAt   string                     `json:"last_rate_limited_at,omitempty"`
+	LastTimeoutAt       string                     `json:"last_timeout_at,omitempty"`
+	LastServerErrorAt   string                     `json:"last_server_error_at,omitempty"`
+	Locked              bool                       `json:"locked"`
 }
 
 type schedulerBreakdownResponse struct {
@@ -282,6 +302,179 @@ type schedulerBreakdownResponse struct {
 	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
 
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func sanitizeProxyProviderURL(raw string) (string, error) {
+	raw = strings.TrimSpace(security.SanitizeInput(raw))
+	if raw == "" {
+		return "", nil
+	}
+	parsed, err := neturl.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("动态代理 URL 无效")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("动态代理 URL 仅支持 http/https")
+	}
+	return raw, nil
+}
+
+func buildProxyConfigInput(mode, proxyURL, providerURL, scheme string, poolEnabled bool, allowInherit bool) (database.ProxyConfigInput, error) {
+	proxyURL = strings.TrimSpace(security.SanitizeInput(proxyURL))
+	if err := security.ValidateProxyURL(proxyURL); err != nil {
+		return database.ProxyConfigInput{}, err
+	}
+
+	sanitizedProviderURL, err := sanitizeProxyProviderURL(providerURL)
+	if err != nil {
+		return database.ProxyConfigInput{}, err
+	}
+
+	cfg := database.ProxyConfigInput{
+		Mode:        auth.NormalizeProxyMode(mode, proxyURL, sanitizedProviderURL, poolEnabled, allowInherit),
+		URL:         proxyURL,
+		ProviderURL: sanitizedProviderURL,
+		Scheme:      auth.NormalizeProxyScheme(scheme),
+	}
+
+	if cfg.Mode == auth.ProxyModeDynamic && cfg.ProviderURL == "" {
+		return database.ProxyConfigInput{}, fmt.Errorf("动态代理模式必须提供 provider URL")
+	}
+	if cfg.Mode == auth.ProxyModeStatic && cfg.URL == "" && !allowInherit {
+		cfg.Mode = auth.ProxyModeNone
+	}
+	return cfg, nil
+}
+
+func (h *Handler) buildProxyConfigInput(mode, proxyURL, providerURL, protocol, schemeDefault string) (database.ProxyConfigInput, error) {
+	return buildProxyConfigInput(mode, proxyURL, providerURL, firstNonEmptyString(protocol, schemeDefault), h.store.GetProxyPoolEnabled(), true)
+}
+
+func isPrivateOrLocalIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
+		return true
+	}
+	if ip.IsPrivate() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		// 100.64.0.0/10 carrier-grade NAT
+		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return true
+		}
+	}
+	return false
+}
+
+type externalURLValidationOptions struct {
+	allowEmpty        bool
+	trimTrailingSlash bool
+	rejectQuery       bool
+	rejectFragment    bool
+	rejectPrivate     bool
+}
+
+func validateExternalURL(ctx context.Context, raw string, fieldName string, opts externalURLValidationOptions) (string, error) {
+	raw = strings.TrimSpace(security.SanitizeInput(raw))
+	if raw == "" {
+		if opts.allowEmpty {
+			return "", nil
+		}
+		return "", fmt.Errorf("%s 不能为空", fieldName)
+	}
+
+	parsed, err := neturl.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("%s 格式无效", fieldName)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("%s 仅支持 http/https 协议", fieldName)
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("%s 不允许包含用户信息", fieldName)
+	}
+	if opts.rejectQuery && parsed.RawQuery != "" {
+		return "", fmt.Errorf("%s 不允许包含查询参数", fieldName)
+	}
+	if opts.rejectFragment && parsed.Fragment != "" {
+		return "", fmt.Errorf("%s 不允许包含片段", fieldName)
+	}
+
+	hostname := strings.TrimSpace(parsed.Hostname())
+	if hostname == "" {
+		return "", fmt.Errorf("%s 主机无效", fieldName)
+	}
+
+	if opts.rejectPrivate {
+		switch strings.ToLower(hostname) {
+		case "localhost", "localhost.localdomain":
+			return "", fmt.Errorf("不允许使用本地地址")
+		}
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if ip := net.ParseIP(hostname); ip != nil {
+			if isPrivateOrLocalIP(ip) {
+				return "", fmt.Errorf("不允许访问内网或本地地址")
+			}
+		} else {
+			resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			addrs, err := net.DefaultResolver.LookupIPAddr(resolveCtx, hostname)
+			if err != nil {
+				return "", fmt.Errorf("解析远程地址失败: %w", err)
+			}
+			if len(addrs) == 0 {
+				return "", fmt.Errorf("远程地址无可用 IP")
+			}
+			for _, addr := range addrs {
+				if isPrivateOrLocalIP(addr.IP) {
+					return "", fmt.Errorf("不允许访问内网或本地地址")
+				}
+			}
+		}
+	}
+
+	if opts.trimTrailingSlash {
+		return strings.TrimRight(raw, "/"), nil
+	}
+	return raw, nil
+}
+
+func validateExternalServiceBaseURL(ctx context.Context, raw string, fieldName string) (string, error) {
+	return validateExternalURL(ctx, raw, fieldName, externalURLValidationOptions{
+		allowEmpty:        true,
+		trimTrailingSlash: true,
+		rejectQuery:       true,
+		rejectFragment:    true,
+	})
+}
+
+func validateExternalTargetURL(ctx context.Context, raw string, fieldName string) (string, error) {
+	return validateExternalURL(ctx, raw, fieldName, externalURLValidationOptions{
+		allowEmpty: true,
+	})
+}
+
+func validateMigrationRemoteURL(ctx context.Context, raw string) (string, error) {
+	return validateExternalURL(ctx, raw, "url", externalURLValidationOptions{
+		trimTrailingSlash: true,
+		rejectQuery:       true,
+		rejectFragment:    true,
+		rejectPrivate:     true,
+	})
+}
+
 // ListAccounts 获取账号列表
 func (h *Handler) ListAccounts(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
@@ -292,7 +485,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	rows, err := h.db.ListActive(ctx)
 	if err != nil {
-		writeInternalError(c, err)
+		writeLoggedInternalError(c, "获取账号列表失败", err)
 		return
 	}
 
@@ -308,18 +501,42 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
 		resp := accountResponse{
-			ID:        row.ID,
-			Name:      row.Name,
-			Email:     row.GetCredential("email"),
-			PlanType:  row.GetCredential("plan_type"),
-			Status:    row.Status,
-			ATOnly:    row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
-			ProxyURL:  row.ProxyURL,
-			Locked:    row.Locked,
-			CreatedAt: row.CreatedAt.Format(time.RFC3339),
-			UpdatedAt: row.UpdatedAt.Format(time.RFC3339),
+			ID:               row.ID,
+			Name:             row.Name,
+			Email:            row.GetCredential("email"),
+			PlanType:         row.GetCredential("plan_type"),
+			Status:           row.Status,
+			ATOnly:           row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ProxyURL:         row.ProxyURL,
+			ProxyMode:        auth.NormalizeProxyMode(row.ProxyMode, row.ProxyURL, row.ProxyProviderURL, false, true),
+			ProxyProviderURL: row.ProxyProviderURL,
+			ProxyProtocol:    auth.NormalizeProxyScheme(row.ProxySchemeDefault),
+			ProxyAssignedURL: row.AssignedProxyURL,
+			ProxyLastError:   row.ProxyLastError,
+			Locked:           row.Locked,
+			CreatedAt:        row.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:        row.UpdatedAt.Format(time.RFC3339),
+		}
+		if !row.ProxyLastSwitchedAt.IsZero() {
+			resp.ProxyAssignedAt = row.ProxyLastSwitchedAt.Format(time.RFC3339)
+			resp.ProxyLastSwitchedAt = row.ProxyLastSwitchedAt.Format(time.RFC3339)
 		}
 		if acc, ok := accountMap[row.ID]; ok {
+			acc.Mu().RLock()
+			resp.ProxyMode = auth.NormalizeProxyMode(acc.ProxyMode, acc.ProxyURL, acc.ProxyProviderURL, false, true)
+			resp.ProxyProviderURL = acc.ProxyProviderURL
+			resp.ProxyProtocol = auth.NormalizeProxyScheme(acc.ProxySchemeDefault)
+			if acc.AssignedProxyURL != "" {
+				resp.ProxyAssignedURL = acc.AssignedProxyURL
+			}
+			if !acc.ProxyLastSwitchedAt.IsZero() {
+				resp.ProxyAssignedAt = acc.ProxyLastSwitchedAt.Format(time.RFC3339)
+				resp.ProxyLastSwitchedAt = acc.ProxyLastSwitchedAt.Format(time.RFC3339)
+			}
+			if acc.ProxyLastError != "" {
+				resp.ProxyLastError = acc.ProxyLastError
+			}
+			acc.Mu().RUnlock()
 			resp.ActiveRequests = acc.GetActiveRequests()
 			resp.TotalRequests = acc.GetTotalRequests()
 			debug := acc.GetSchedulerDebugSnapshot(int64(h.store.GetMaxConcurrency()))
@@ -374,7 +591,10 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		accounts = append(accounts, resp)
 	}
 
-	c.JSON(http.StatusOK, accountsResponse{Accounts: accounts})
+	c.JSON(http.StatusOK, accountsResponse{
+		Accounts:         accounts,
+		RefreshScheduler: h.getRefreshSchedulerResponse(),
+	})
 }
 
 // getCachedRequestCounts 返回带 30 秒 TTL 的账号请求统计缓存
@@ -404,9 +624,13 @@ func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCou
 }
 
 type addAccountReq struct {
-	Name         string `json:"name"`
-	RefreshToken string `json:"refresh_token"`
-	ProxyURL     string `json:"proxy_url"`
+	Name             string `json:"name"`
+	RefreshToken     string `json:"refresh_token"`
+	ProxyURL         string `json:"proxy_url"`
+	ProxyMode        string `json:"proxy_mode"`
+	ProxyProviderURL string `json:"proxy_provider_url"`
+	ProxyProtocol    string `json:"proxy_protocol"`
+	ProxyScheme      string `json:"proxy_scheme_default"`
 }
 
 // AddAccount 添加新账号（支持批量：refresh_token 按行分割）
@@ -420,6 +644,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	// 输入验证和清理
 	req.Name = security.SanitizeInput(req.Name)
 	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	req.ProxyProviderURL = strings.TrimSpace(req.ProxyProviderURL)
 
 	if req.RefreshToken == "" {
 		writeError(c, http.StatusBadRequest, "refresh_token 是必填字段")
@@ -438,9 +663,9 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		return
 	}
 
-	// 验证代理URL
-	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
-		writeError(c, http.StatusBadRequest, "代理URL无效")
+	proxyCfg, err := buildProxyConfigInput(req.ProxyMode, req.ProxyURL, req.ProxyProviderURL, firstNonEmptyString(req.ProxyProtocol, req.ProxyScheme), h.store.GetProxyPoolEnabled(), true)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "代理配置无效: "+err.Error())
 		return
 	}
 
@@ -479,7 +704,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
 		}
 
-		id, err := h.db.InsertAccount(ctx, name, rt, req.ProxyURL)
+		id, err := h.db.InsertAccountWithProxyConfig(ctx, name, rt, proxyCfg)
 		if err != nil {
 			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -491,22 +716,15 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 		// 热加载：直接加入内存池
 		newAcc := &auth.Account{
-			DBID:         id,
-			RefreshToken: rt,
-			ProxyURL:     req.ProxyURL,
+			DBID:               id,
+			RefreshToken:       rt,
+			ProxyURL:           proxyCfg.URL,
+			ProxyMode:          proxyCfg.Mode,
+			ProxyProviderURL:   proxyCfg.ProviderURL,
+			ProxySchemeDefault: proxyCfg.Scheme,
 		}
 		h.store.AddAccount(newAcc)
-
-		// 异步刷新 AT
-		go func(accountID int64) {
-			refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-				log.Printf("新账号 %d 刷新失败: %v", accountID, err)
-			} else {
-				log.Printf("新账号 %d 刷新成功，已加入号池", accountID)
-			}
-		}(id)
+		h.store.EnqueueImportRefresh(id)
 	}
 
 	// 记录安全审计日志
@@ -526,9 +744,13 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 // addATAccountReq AT 模式添加账号请求
 type addATAccountReq struct {
-	Name        string `json:"name"`
-	AccessToken string `json:"access_token"`
-	ProxyURL    string `json:"proxy_url"`
+	Name             string `json:"name"`
+	AccessToken      string `json:"access_token"`
+	ProxyURL         string `json:"proxy_url"`
+	ProxyMode        string `json:"proxy_mode"`
+	ProxyProviderURL string `json:"proxy_provider_url"`
+	ProxyProtocol    string `json:"proxy_protocol"`
+	ProxyScheme      string `json:"proxy_scheme_default"`
 }
 
 // AddATAccount 添加 AT-only 账号（支持批量：access_token 按行分割）
@@ -541,6 +763,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 
 	req.Name = security.SanitizeInput(req.Name)
 	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	req.ProxyProviderURL = strings.TrimSpace(req.ProxyProviderURL)
 
 	if req.AccessToken == "" {
 		writeError(c, http.StatusBadRequest, "access_token 是必填字段")
@@ -557,12 +780,13 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		return
 	}
 
-	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
-		writeError(c, http.StatusBadRequest, "代理URL无效")
+	proxyCfg, err := buildProxyConfigInput(req.ProxyMode, req.ProxyURL, req.ProxyProviderURL, firstNonEmptyString(req.ProxyProtocol, req.ProxyScheme), h.store.GetProxyPoolEnabled(), true)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "代理配置无效: "+err.Error())
 		return
 	}
 
-	// 按行分割，支持批量添加
+	// ???????????
 	lines := strings.Split(req.AccessToken, "\n")
 	var tokens []string
 	for _, line := range lines {
@@ -596,7 +820,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
 		}
 
-		id, err := h.db.InsertATAccount(ctx, name, at, req.ProxyURL)
+		id, err := h.db.InsertATAccountWithProxyConfig(ctx, name, at, proxyCfg)
 		if err != nil {
 			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -611,10 +835,13 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 
 		// 热加载到内存池（AT-only，无 RT）
 		newAcc := &auth.Account{
-			DBID:        id,
-			AccessToken: at,
-			ExpiresAt:   time.Now().Add(1 * time.Hour),
-			ProxyURL:    req.ProxyURL,
+			DBID:               id,
+			AccessToken:        at,
+			ExpiresAt:          time.Now().Add(1 * time.Hour),
+			ProxyURL:           proxyCfg.URL,
+			ProxyMode:          proxyCfg.Mode,
+			ProxyProviderURL:   proxyCfg.ProviderURL,
+			ProxySchemeDefault: proxyCfg.Scheme,
 		}
 		if atInfo != nil {
 			newAcc.Email = atInfo.Email
@@ -772,20 +999,30 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 // ImportAccounts 批量导入账号（支持 TXT / JSON）
 func (h *Handler) ImportAccounts(c *gin.Context) {
 	format := c.DefaultPostForm("format", "txt")
-	proxyURL := c.PostForm("proxy_url")
+	proxyCfg, err := h.buildProxyConfigInput(
+		c.PostForm("proxy_mode"),
+		c.PostForm("proxy_url"),
+		c.PostForm("proxy_provider_url"),
+		c.PostForm("proxy_protocol"),
+		c.PostForm("proxy_scheme_default"),
+	)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "代理配置无效: "+err.Error())
+		return
+	}
 
 	switch format {
 	case "json":
-		h.importAccountsJSON(c, proxyURL)
+		h.importAccountsJSON(c, proxyCfg)
 	case "at_txt":
-		h.importAccountsATTXT(c, proxyURL)
+		h.importAccountsATTXT(c, proxyCfg)
 	default:
-		h.importAccountsTXT(c, proxyURL)
+		h.importAccountsTXT(c, proxyCfg)
 	}
 }
 
 // importAccountsTXT 通过 TXT 文件导入（每行一个 RT）
-func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string) {
+func (h *Handler) importAccountsTXT(c *gin.Context, proxyCfg database.ProxyConfigInput) {
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "请上传文件（字段名: file）")
@@ -798,9 +1035,13 @@ func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	data, err := io.ReadAll(file)
+	data, err := io.ReadAll(io.LimitReader(file, 2*1024*1024+1))
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "读取文件失败")
+		return
+	}
+	if len(data) > 2*1024*1024 {
+		writeError(c, http.StatusBadRequest, "文件大小不能超过 2MB")
 		return
 	}
 
@@ -822,11 +1063,11 @@ func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	h.importAccountsCommon(c, tokens, proxyURL)
+	h.importAccountsCommon(c, tokens, proxyCfg)
 }
 
 // importAccountsJSON 通过 JSON 文件导入（兼容 CLIProxyAPI 凭证格式）
-func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
+func (h *Handler) importAccountsJSON(c *gin.Context, proxyCfg database.ProxyConfigInput) {
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 		writeError(c, http.StatusBadRequest, "解析表单失败")
 		return
@@ -851,10 +1092,14 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("打开文件 %s 失败", fh.Filename))
 			return
 		}
-		data, err := io.ReadAll(f)
+		data, err := io.ReadAll(io.LimitReader(f, 2*1024*1024+1))
 		f.Close()
 		if err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("读取文件 %s 失败", fh.Filename))
+			return
+		}
+		if len(data) > 2*1024*1024 {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 大小不能超过 2MB", fh.Filename))
 			return
 		}
 
@@ -872,7 +1117,7 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	h.importAccountsCommon(c, allTokens, proxyURL)
+	h.importAccountsCommon(c, allTokens, proxyCfg)
 }
 
 // importEvent SSE 导入进度事件
@@ -885,10 +1130,18 @@ type importEvent struct {
 	Failed    int    `json:"failed"`
 }
 
-func sendImportEvent(c *gin.Context, e importEvent) {
+func canStreamImportEvent(c *gin.Context) bool {
+	return c != nil && c.Request != nil && c.Request.Context().Err() == nil
+}
+
+func sendImportEvent(c *gin.Context, e importEvent) bool {
+	if !canStreamImportEvent(c) {
+		return false
+	}
 	data, _ := json.Marshal(e)
 	fmt.Fprintf(c.Writer, "data: %s\n\n", data)
 	c.Writer.Flush()
+	return true
 }
 
 func setupSSE(c *gin.Context) {
@@ -896,11 +1149,13 @@ func setupSSE(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
-	c.Writer.Flush()
+	if canStreamImportEvent(c) {
+		c.Writer.Flush()
+	}
 }
 
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
-func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string) {
+func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyCfg database.ProxyConfigInput) {
 	// 文件内去重（RT 和 AT 分别去重）
 	seenRT := make(map[string]bool)
 	seenAT := make(map[string]bool)
@@ -982,7 +1237,9 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 	// 进度推送 goroutine：定时发送，避免每条都写造成 IO 瓶颈
 	done := make(chan struct{})
+	reporterDone := make(chan struct{})
 	go func() {
+		defer close(reporterDone)
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -995,6 +1252,8 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					Type: "progress", Current: cur + duplicateCount, Total: total,
 					Success: suc, Duplicate: duplicateCount, Failed: fai,
 				})
+			case <-c.Request.Context().Done():
+				return
 			case <-done:
 				return
 			}
@@ -1017,7 +1276,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, err := h.db.InsertATAccount(insertCtx, name, tok.accessToken, proxyURL)
+				id, err := h.db.InsertATAccountWithProxyConfig(insertCtx, name, tok.accessToken, proxyCfg)
 				insertCancel()
 
 				if err != nil {
@@ -1033,10 +1292,13 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 				atInfo := auth.ParseAccessToken(tok.accessToken)
 				newAcc := &auth.Account{
-					DBID:        id,
-					AccessToken: tok.accessToken,
-					ExpiresAt:   time.Now().Add(1 * time.Hour),
-					ProxyURL:    proxyURL,
+					DBID:               id,
+					AccessToken:        tok.accessToken,
+					ExpiresAt:          time.Now().Add(1 * time.Hour),
+					ProxyURL:           proxyCfg.URL,
+					ProxyMode:          proxyCfg.Mode,
+					ProxyProviderURL:   proxyCfg.ProviderURL,
+					ProxySchemeDefault: proxyCfg.Scheme,
 				}
 				if atInfo != nil {
 					newAcc.Email = atInfo.Email
@@ -1062,7 +1324,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, err := h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
+				id, err := h.db.InsertAccountWithProxyConfig(insertCtx, name, tok.refreshToken, proxyCfg)
 				insertCancel()
 
 				if err != nil {
@@ -1077,28 +1339,22 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				h.db.InsertAccountEventAsync(id, "added", "import")
 
 				newAcc := &auth.Account{
-					DBID:         id,
-					RefreshToken: tok.refreshToken,
-					ProxyURL:     proxyURL,
+					DBID:               id,
+					RefreshToken:       tok.refreshToken,
+					ProxyURL:           proxyCfg.URL,
+					ProxyMode:          proxyCfg.Mode,
+					ProxyProviderURL:   proxyCfg.ProviderURL,
+					ProxySchemeDefault: proxyCfg.Scheme,
 				}
 				h.store.AddAccount(newAcc)
-
-				// 后台异步刷新，不阻塞导入流程
-				go func(accountID int64) {
-					refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					defer cancel()
-					if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-						log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
-					} else {
-						log.Printf("导入账号 %d 刷新成功", accountID)
-					}
-				}(id)
+				h.store.EnqueueImportRefresh(id)
 			}
 		}(i, t)
 	}
 
 	wg.Wait()
 	close(done)
+	<-reporterDone
 
 	// 发送完成事件
 	suc := int(atomic.LoadInt64(&successCount))
@@ -1112,7 +1368,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 }
 
 // importAccountsATTXT 通过 TXT 文件导入 AT-only 账号（每行一个 Access Token）
-func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
+func (h *Handler) importAccountsATTXT(c *gin.Context, proxyCfg database.ProxyConfigInput) {
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "请上传文件（字段名: file）")
@@ -1125,9 +1381,13 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	data, err := io.ReadAll(file)
+	data, err := io.ReadAll(io.LimitReader(file, 2*1024*1024+1))
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "读取文件失败")
+		return
+	}
+	if len(data) > 2*1024*1024 {
+		writeError(c, http.StatusBadRequest, "文件大小不能超过 2MB")
 		return
 	}
 
@@ -1191,7 +1451,9 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 	var wg sync.WaitGroup
 
 	done := make(chan struct{})
+	reporterDone := make(chan struct{})
 	go func() {
+		defer close(reporterDone)
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -1204,6 +1466,8 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 					Type: "progress", Current: cur + duplicateCount, Total: total,
 					Success: suc, Duplicate: duplicateCount, Failed: fai,
 				})
+			case <-c.Request.Context().Done():
+				return
 			case <-done:
 				return
 			}
@@ -1220,7 +1484,7 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 			name := fmt.Sprintf("at-import-%d", idx+1)
 
 			insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			id, err := h.db.InsertATAccount(insertCtx, name, accessToken, proxyURL)
+			id, err := h.db.InsertATAccountWithProxyConfig(insertCtx, name, accessToken, proxyCfg)
 			insertCancel()
 
 			if err != nil {
@@ -1238,10 +1502,13 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 			atInfo := auth.ParseAccessToken(accessToken)
 
 			newAcc := &auth.Account{
-				DBID:        id,
-				AccessToken: accessToken,
-				ExpiresAt:   time.Now().Add(1 * time.Hour),
-				ProxyURL:    proxyURL,
+				DBID:               id,
+				AccessToken:        accessToken,
+				ExpiresAt:          time.Now().Add(1 * time.Hour),
+				ProxyURL:           proxyCfg.URL,
+				ProxyMode:          proxyCfg.Mode,
+				ProxyProviderURL:   proxyCfg.ProviderURL,
+				ProxySchemeDefault: proxyCfg.Scheme,
 			}
 			if atInfo != nil {
 				newAcc.Email = atInfo.Email
@@ -1271,6 +1538,7 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 
 	wg.Wait()
 	close(done)
+	<-reporterDone
 
 	suc := int(atomic.LoadInt64(&successCount))
 	fai := int(atomic.LoadInt64(&failCount))
@@ -1282,30 +1550,11 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 	log.Printf("AT 导入完成: success=%d, duplicate=%d, failed=%d, total=%d", suc, duplicateCount, fai, total)
 }
 
-// GetAccountUsage 查询单个账号的用量统计
-func (h *Handler) GetAccountUsage(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		writeError(c, http.StatusBadRequest, "无效的账号 ID")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
-	defer cancel()
-
-	detail, err := h.db.GetAccountUsageStats(ctx, id)
-	if err != nil {
-		writeInternalError(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, detail)
-}
-
 // DeleteAccount 删除账号
 func (h *Handler) DeleteAccount(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
+	if err != nil || id <= 0 {
 		writeError(c, http.StatusBadRequest, "无效的账号 ID")
 		return
 	}
@@ -1315,7 +1564,11 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 
 	// 标记为 deleted 而非物理删除
 	if err := h.db.SetError(ctx, id, "deleted"); err != nil {
-		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeLoggedInternalError(c, "删除失败", err)
 		return
 	}
 
@@ -1330,7 +1583,7 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 func (h *Handler) RefreshAccount(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
+	if err != nil || id <= 0 {
 		writeError(c, http.StatusBadRequest, "无效的账号 ID")
 		return
 	}
@@ -1343,11 +1596,11 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 		refreshFn = h.refreshSingleAccount
 	}
 	if err := refreshFn(ctx, id); err != nil {
-		if strings.Contains(err.Error(), "不存在") {
+		if errors.Is(err, auth.ErrAccountNotFound) || strings.Contains(err.Error(), "不存在") {
 			writeError(c, http.StatusNotFound, err.Error())
 			return
 		}
-		writeError(c, http.StatusInternalServerError, "刷新失败: "+err.Error())
+		writeLoggedInternalError(c, "刷新失败", err)
 		return
 	}
 
@@ -1358,7 +1611,7 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 func (h *Handler) ToggleAccountLock(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
+	if err != nil || id <= 0 {
 		writeError(c, http.StatusBadRequest, "无效的账号 ID")
 		return
 	}
@@ -1375,7 +1628,11 @@ func (h *Handler) ToggleAccountLock(c *gin.Context) {
 	defer cancel()
 
 	if err := h.db.SetAccountLocked(ctx, id, req.Locked); err != nil {
-		writeError(c, http.StatusInternalServerError, "更新锁定状态失败: "+err.Error())
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeLoggedInternalError(c, "更新锁定状态失败", err)
 		return
 	}
 
@@ -1407,375 +1664,260 @@ func (h *Handler) refreshSingleAccount(ctx context.Context, id int64) error {
 // GetHealth 系统健康检查（扩展版）
 func (h *Handler) GetHealth(c *gin.Context) {
 	c.JSON(http.StatusOK, healthResponse{
-		Status:    "ok",
-		Available: h.store.AvailableCount(),
-		Total:     h.store.AccountCount(),
+		Status:           "ok",
+		Available:        h.store.AvailableCount(),
+		Total:            h.store.AccountCount(),
+		RefreshScheduler: h.getRefreshSchedulerResponse(),
 	})
 }
 
-// ==================== Usage ====================
-
-// GetUsageStats 获取使用统计
-func (h *Handler) GetUsageStats(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
-
-	stats, err := h.db.GetUsageStats(ctx)
-	if err != nil {
-		writeInternalError(c, err)
-		return
+func (h *Handler) getRefreshSchedulerResponse() refreshStatusResponse {
+	status := h.store.GetRefreshSchedulerStatus()
+	resp := refreshStatusResponse{
+		Running:        status.Running,
+		TotalAccounts:  status.TotalAccounts,
+		TargetAccounts: status.TargetAccounts,
+		Processed:      status.Processed,
+		Success:        status.Success,
+		Failure:        status.Failure,
 	}
-	c.JSON(http.StatusOK, stats)
+	if !status.NextScanAt.IsZero() {
+		resp.NextScanAt = status.NextScanAt.Format(time.RFC3339)
+	}
+	if !status.StartedAt.IsZero() {
+		resp.StartedAt = status.StartedAt.Format(time.RFC3339)
+	}
+	if !status.FinishedAt.IsZero() {
+		resp.FinishedAt = status.FinishedAt.Format(time.RFC3339)
+	}
+	return resp
 }
 
-// GetChartData 返回图表聚合数据（服务端分桶 + 内存缓存）
-func (h *Handler) GetChartData(c *gin.Context) {
-	startStr := c.Query("start")
-	endStr := c.Query("end")
-	bucketStr := c.DefaultQuery("bucket_minutes", "5")
-
-	startTime, e1 := time.Parse(time.RFC3339, startStr)
-	endTime, e2 := time.Parse(time.RFC3339, endStr)
-	if e1 != nil || e2 != nil {
-		writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
-		return
+func (h *Handler) getRefreshConfigResponse() refreshConfigResponse {
+	return refreshConfigResponse{
+		ScanEnabled:         h.store.GetRefreshScanEnabled(),
+		ScanIntervalSeconds: int(h.store.GetRefreshScanInterval().Seconds()),
+		PreExpireSeconds:    int(h.store.GetRefreshPreExpireWindow().Seconds()),
 	}
-	bucketMinutes, _ := strconv.Atoi(bucketStr)
-	if bucketMinutes < 1 {
-		bucketMinutes = 5
-	}
-
-	// 检查内存缓存（10秒 TTL）
-	cacheKey := fmt.Sprintf("%s|%s|%d", startStr, endStr, bucketMinutes)
-	h.chartCacheMu.RLock()
-	if entry, ok := h.chartCacheData[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
-		h.chartCacheMu.RUnlock()
-		c.JSON(http.StatusOK, entry.data)
-		return
-	}
-	h.chartCacheMu.RUnlock()
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
-	defer cancel()
-
-	result, err := h.db.GetChartAggregation(ctx, startTime, endTime, bucketMinutes)
-	if err != nil {
-		writeInternalError(c, err)
-		return
-	}
-
-	// 写入缓存
-	h.chartCacheMu.Lock()
-	h.chartCacheData[cacheKey] = &chartCacheEntry{
-		data:      result,
-		expiresAt: time.Now().Add(10 * time.Second),
-	}
-	// 清理过期条目（延迟清理，避免内存泄漏）
-	for k, v := range h.chartCacheData {
-		if time.Now().After(v.expiresAt) {
-			delete(h.chartCacheData, k)
-		}
-	}
-	h.chartCacheMu.Unlock()
-
-	c.JSON(http.StatusOK, result)
 }
-
-// GetUsageLogs 获取使用日志
-func (h *Handler) GetUsageLogs(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
-	defer cancel()
-
-	startStr := c.Query("start")
-	endStr := c.Query("end")
-
-	if startStr != "" && endStr != "" {
-		startTime, e1 := time.Parse(time.RFC3339, startStr)
-		endTime, e2 := time.Parse(time.RFC3339, endStr)
-		if e1 != nil || e2 != nil {
-			writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
-			return
-		}
-
-		// 有 page 参数 → 服务端分页（Usage 页面表格）
-		if pageStr := c.Query("page"); pageStr != "" {
-			page, _ := strconv.Atoi(pageStr)
-			pageSize := 20
-			if ps := c.Query("page_size"); ps != "" {
-				if n, err := strconv.Atoi(ps); err == nil && n > 0 && n <= 200 {
-					pageSize = n
-				}
-			}
-			var apiKeyID *int64
-			if apiKeyIDStr := c.Query("api_key_id"); apiKeyIDStr != "" {
-				parsed, err := strconv.ParseInt(apiKeyIDStr, 10, 64)
-				if err != nil || parsed <= 0 {
-					writeError(c, http.StatusBadRequest, "api_key_id 参数无效，需要正整数")
-					return
-				}
-				apiKeyID = &parsed
-			}
-
-			filter := database.UsageLogFilter{
-				Start:    startTime,
-				End:      endTime,
-				Page:     page,
-				PageSize: pageSize,
-				Email:    c.Query("email"),
-				Model:    c.Query("model"),
-				Endpoint: c.Query("endpoint"),
-				APIKeyID: apiKeyID,
-			}
-			if fastStr := c.Query("fast"); fastStr != "" {
-				v := fastStr == "true"
-				filter.FastOnly = &v
-			}
-			if streamStr := c.Query("stream"); streamStr != "" {
-				v := streamStr == "true"
-				filter.StreamOnly = &v
-			}
-
-			result, err := h.db.ListUsageLogsByTimeRangePaged(ctx, filter)
-			if err != nil {
-				writeInternalError(c, err)
-				return
-			}
-			c.JSON(http.StatusOK, result)
-			return
-		}
-
-		// 无 page 参数 → 返回全量（Dashboard 图表聚合）
-		logs, err := h.db.ListUsageLogsByTimeRange(ctx, startTime, endTime)
-		if err != nil {
-			writeInternalError(c, err)
-			return
-		}
-		if logs == nil {
-			logs = []*database.UsageLog{}
-		}
-		c.JSON(http.StatusOK, usageLogsResponse{Logs: logs})
-		return
-	}
-
-	// 回退：limit 模式
-	limit := 50
-	if l := c.Query("limit"); l != "" {
-		if n, err := strconv.Atoi(l); err == nil && n > 0 {
-			limit = n
-		}
-	}
-	logs, err := h.db.ListRecentUsageLogs(ctx, limit)
-	if err != nil {
-		writeInternalError(c, err)
-		return
-	}
-	if logs == nil {
-		logs = []*database.UsageLog{}
-	}
-	c.JSON(http.StatusOK, usageLogsResponse{Logs: logs})
-}
-
-// ClearUsageLogs 清空所有使用日志
-func (h *Handler) ClearUsageLogs(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
-	defer cancel()
-
-	if err := h.db.ClearUsageLogs(ctx); err != nil {
-		writeInternalError(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"message": "日志已清空"})
-}
-
-// ==================== API Keys ====================
-
-// ListAPIKeys 获取所有 API 密钥（脱敏版本）
-func (h *Handler) ListAPIKeys(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
-
-	keys, err := h.db.ListAPIKeys(ctx)
-	if err != nil {
-		writeInternalError(c, err)
-		return
-	}
-
-	// 转换为脱敏响应
-	maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
-	for _, k := range keys {
-		maskedKeys = append(maskedKeys, NewMaskedAPIKeyRow(k))
-	}
-
-	c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
-}
-
-type createKeyReq struct {
-	Name string `json:"name"`
-	Key  string `json:"key"`
-}
-
-// generateKey 生成随机 API Key
-func generateKey() string {
-	b := make([]byte, 24)
-	rand.Read(b)
-	return "sk-" + hex.EncodeToString(b)
-}
-
-// CreateAPIKey 创建新 API 密钥（增强版，带输入验证）
-func (h *Handler) CreateAPIKey(c *gin.Context) {
-	var req createKeyReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		req.Name = ""
-	}
-
-	// 输入验证和清理
-	req.Name = security.SanitizeInput(req.Name)
-	if req.Name == "" {
-		req.Name = "default"
-	}
-
-	// 验证名称长度
-	if utf8.RuneCountInString(req.Name) > 100 {
-		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
-		return
-	}
-
-	// 检查XSS
-	if security.ContainsXSS(req.Name) {
-		writeError(c, http.StatusBadRequest, "名称包含非法字符")
-		return
-	}
-
-	key := req.Key
-	if key == "" {
-		key = generateKey()
-	} else {
-		// 验证用户提供的key格式
-		key = security.SanitizeInput(key)
-		if !strings.HasPrefix(key, "sk-") || len(key) < 20 {
-			writeError(c, http.StatusBadRequest, "API Key格式无效")
-			return
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
-
-	id, err := h.db.InsertAPIKey(ctx, req.Name, key)
-	if err != nil {
-		writeError(c, http.StatusInternalServerError, "创建失败: "+err.Error())
-		return
-	}
-
-	// 记录安全审计日志
-	security.SecurityAuditLog("API_KEY_CREATED", fmt.Sprintf("id=%d name=%s ip=%s", id, security.SanitizeLog(req.Name), c.ClientIP()))
-
-	c.JSON(http.StatusOK, createAPIKeyResponse{
-		ID:   id,
-		Key:  key,
-		Name: req.Name,
-	})
-}
-
-// DeleteAPIKey 删除 API 密钥
-func (h *Handler) DeleteAPIKey(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		writeError(c, http.StatusBadRequest, "无效 ID")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
-
-	if err := h.db.DeleteAPIKey(ctx, id); err != nil {
-		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
-		return
-	}
-	writeMessage(c, http.StatusOK, "已删除")
-}
-
-// ==================== Settings ====================
 
 type settingsResponse struct {
-	MaxConcurrency         int    `json:"max_concurrency"`
-	GlobalRPM              int    `json:"global_rpm"`
-	TestModel              string `json:"test_model"`
-	TestConcurrency        int    `json:"test_concurrency"`
-	ProxyURL               string `json:"proxy_url"`
-	PgMaxConns             int    `json:"pg_max_conns"`
-	RedisPoolSize          int    `json:"redis_pool_size"`
-	AutoCleanUnauthorized  bool   `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited   bool   `json:"auto_clean_rate_limited"`
-	AdminSecret            string `json:"admin_secret"`
-	AdminAuthSource        string `json:"admin_auth_source"`
-	AutoCleanFullUsage     bool   `json:"auto_clean_full_usage"`
-	AutoCleanError         bool   `json:"auto_clean_error"`
-	AutoCleanExpired       bool   `json:"auto_clean_expired"`
-	ProxyPoolEnabled       bool   `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled   bool   `json:"fast_scheduler_enabled"`
-	MaxRetries             int    `json:"max_retries"`
-	AllowRemoteMigration   bool   `json:"allow_remote_migration"`
-	DatabaseDriver         string `json:"database_driver"`
-	DatabaseLabel          string `json:"database_label"`
-	CacheDriver            string `json:"cache_driver"`
-	CacheLabel             string `json:"cache_label"`
-	ExpiredCleaned         int    `json:"expired_cleaned,omitempty"`
-	ModelMapping           string `json:"model_mapping"`
-	CPASyncEnabled         bool   `json:"cpa_sync_enabled"`
-	CPABaseURL             string `json:"cpa_base_url"`
-	CPAAdminKey            string `json:"cpa_admin_key"`
-	CPAMinAccounts         int    `json:"cpa_min_accounts"`
-	CPAMaxAccounts         int    `json:"cpa_max_accounts"`
-	CPAMaxUploadsPerHour   int    `json:"cpa_max_uploads_per_hour"`
-	CPASwitchAfterUploads  int    `json:"cpa_switch_after_uploads"`
-	CPASyncIntervalSeconds int    `json:"cpa_sync_interval_seconds"`
-	MihomoBaseURL          string `json:"mihomo_base_url"`
-	MihomoSecret           string `json:"mihomo_secret"`
-	MihomoStrategyGroup    string `json:"mihomo_strategy_group"`
-	MihomoDelayTestURL     string `json:"mihomo_delay_test_url"`
-	MihomoDelayTimeoutMs   int    `json:"mihomo_delay_timeout_ms"`
+	MaxConcurrency                  int    `json:"max_concurrency"`
+	GlobalRPM                       int    `json:"global_rpm"`
+	TestModel                       string `json:"test_model"`
+	TestConcurrency                 int    `json:"test_concurrency"`
+	ProxyURL                        string `json:"proxy_url"`
+	ProxyDefaultMode                string `json:"proxy_default_mode"`
+	ProxyDynamicProviderURL         string `json:"proxy_dynamic_provider_url"`
+	ProxyDefaultProtocol            string `json:"proxy_default_protocol"`
+	ProxyRotationHours              int    `json:"proxy_rotation_hours"`
+	PgMaxConns                      int    `json:"pg_max_conns"`
+	RedisPoolSize                   int    `json:"redis_pool_size"`
+	AutoCleanUnauthorized           bool   `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited            bool   `json:"auto_clean_rate_limited"`
+	AdminSecret                     string `json:"admin_secret"`
+	AdminAuthSource                 string `json:"admin_auth_source"`
+	AutoCleanFullUsage              bool   `json:"auto_clean_full_usage"`
+	AutoCleanError                  bool   `json:"auto_clean_error"`
+	AutoCleanExpired                bool   `json:"auto_clean_expired"`
+	ProxyPoolEnabled                bool   `json:"proxy_pool_enabled"`
+	MaxRetries                      int    `json:"max_retries"`
+	RefreshScanEnabled              bool   `json:"refresh_scan_enabled"`
+	RefreshScanIntervalSeconds      int    `json:"refresh_scan_interval_seconds"`
+	RefreshPreExpireSeconds         int    `json:"refresh_pre_expire_seconds"`
+	RefreshMaxConcurrency           int    `json:"refresh_max_concurrency"`
+	RefreshOnImportEnabled          bool   `json:"refresh_on_import_enabled"`
+	RefreshOnImportConcurrency      int    `json:"refresh_on_import_concurrency"`
+	UsageProbeEnabled               bool   `json:"usage_probe_enabled"`
+	UsageProbeStaleAfterSeconds     int    `json:"usage_probe_stale_after_seconds"`
+	UsageProbeMaxConcurrency        int    `json:"usage_probe_max_concurrency"`
+	RecoveryProbeEnabled            bool   `json:"recovery_probe_enabled"`
+	RecoveryProbeMinIntervalSeconds int    `json:"recovery_probe_min_interval_seconds"`
+	RecoveryProbeMaxConcurrency     int    `json:"recovery_probe_max_concurrency"`
+	AllowRemoteMigration            bool   `json:"allow_remote_migration"`
+	DatabaseDriver                  string `json:"database_driver"`
+	DatabaseLabel                   string `json:"database_label"`
+	CacheDriver                     string `json:"cache_driver"`
+	CacheLabel                      string `json:"cache_label"`
+	ExpiredCleaned                  int    `json:"expired_cleaned,omitempty"`
+	CPASyncEnabled                  bool   `json:"cpa_sync_enabled"`
+	CPABaseURL                      string `json:"cpa_base_url"`
+	CPAAdminKey                     string `json:"cpa_admin_key"`
+	CPAMinAccounts                  int    `json:"cpa_min_accounts"`
+	CPAMaxAccounts                  int    `json:"cpa_max_accounts"`
+	CPAMaxUploadsPerHour            int    `json:"cpa_max_uploads_per_hour"`
+	CPASwitchAfterUploads           int    `json:"cpa_switch_after_uploads"`
+	CPASyncIntervalSeconds          int    `json:"cpa_sync_interval_seconds"`
+	MihomoBaseURL                   string `json:"mihomo_base_url"`
+	MihomoSecret                    string `json:"mihomo_secret"`
+	MihomoStrategyGroup             string `json:"mihomo_strategy_group"`
+	MihomoDelayTestURL              string `json:"mihomo_delay_test_url"`
+	MihomoDelayTimeoutMs            int    `json:"mihomo_delay_timeout_ms"`
 }
 
 type updateSettingsReq struct {
-	MaxConcurrency         *int    `json:"max_concurrency"`
-	GlobalRPM              *int    `json:"global_rpm"`
-	TestModel              *string `json:"test_model"`
-	TestConcurrency        *int    `json:"test_concurrency"`
-	ProxyURL               *string `json:"proxy_url"`
-	PgMaxConns             *int    `json:"pg_max_conns"`
-	RedisPoolSize          *int    `json:"redis_pool_size"`
-	AutoCleanUnauthorized  *bool   `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited   *bool   `json:"auto_clean_rate_limited"`
-	AdminSecret            *string `json:"admin_secret"`
-	AutoCleanFullUsage     *bool   `json:"auto_clean_full_usage"`
-	AutoCleanError         *bool   `json:"auto_clean_error"`
-	AutoCleanExpired       *bool   `json:"auto_clean_expired"`
-	ProxyPoolEnabled       *bool   `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled   *bool   `json:"fast_scheduler_enabled"`
-	MaxRetries             *int    `json:"max_retries"`
-	AllowRemoteMigration   *bool   `json:"allow_remote_migration"`
-	ModelMapping           *string `json:"model_mapping"`
-	CPASyncEnabled         *bool   `json:"cpa_sync_enabled"`
-	CPABaseURL             *string `json:"cpa_base_url"`
-	CPAAdminKey            *string `json:"cpa_admin_key"`
-	CPAMinAccounts         *int    `json:"cpa_min_accounts"`
-	CPAMaxAccounts         *int    `json:"cpa_max_accounts"`
-	CPAMaxUploadsPerHour   *int    `json:"cpa_max_uploads_per_hour"`
-	CPASwitchAfterUploads  *int    `json:"cpa_switch_after_uploads"`
-	CPASyncIntervalSeconds *int    `json:"cpa_sync_interval_seconds"`
-	MihomoBaseURL          *string `json:"mihomo_base_url"`
-	MihomoSecret           *string `json:"mihomo_secret"`
-	MihomoStrategyGroup    *string `json:"mihomo_strategy_group"`
-	MihomoDelayTestURL     *string `json:"mihomo_delay_test_url"`
-	MihomoDelayTimeoutMs   *int    `json:"mihomo_delay_timeout_ms"`
+	MaxConcurrency                  *int    `json:"max_concurrency"`
+	GlobalRPM                       *int    `json:"global_rpm"`
+	TestModel                       *string `json:"test_model"`
+	TestConcurrency                 *int    `json:"test_concurrency"`
+	ProxyURL                        *string `json:"proxy_url"`
+	ProxyDefaultMode                *string `json:"proxy_default_mode"`
+	ProxyDynamicProviderURL         *string `json:"proxy_dynamic_provider_url"`
+	ProxyDefaultProtocol            *string `json:"proxy_default_protocol"`
+	ProxyRotationHours              *int    `json:"proxy_rotation_hours"`
+	PgMaxConns                      *int    `json:"pg_max_conns"`
+	RedisPoolSize                   *int    `json:"redis_pool_size"`
+	AutoCleanUnauthorized           *bool   `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited            *bool   `json:"auto_clean_rate_limited"`
+	AdminSecret                     *string `json:"admin_secret"`
+	AutoCleanFullUsage              *bool   `json:"auto_clean_full_usage"`
+	AutoCleanError                  *bool   `json:"auto_clean_error"`
+	AutoCleanExpired                *bool   `json:"auto_clean_expired"`
+	ProxyPoolEnabled                *bool   `json:"proxy_pool_enabled"`
+	MaxRetries                      *int    `json:"max_retries"`
+	RefreshScanEnabled              *bool   `json:"refresh_scan_enabled"`
+	RefreshScanIntervalSeconds      *int    `json:"refresh_scan_interval_seconds"`
+	RefreshPreExpireSeconds         *int    `json:"refresh_pre_expire_seconds"`
+	RefreshMaxConcurrency           *int    `json:"refresh_max_concurrency"`
+	RefreshOnImportEnabled          *bool   `json:"refresh_on_import_enabled"`
+	RefreshOnImportConcurrency      *int    `json:"refresh_on_import_concurrency"`
+	UsageProbeEnabled               *bool   `json:"usage_probe_enabled"`
+	UsageProbeStaleAfterSeconds     *int    `json:"usage_probe_stale_after_seconds"`
+	UsageProbeMaxConcurrency        *int    `json:"usage_probe_max_concurrency"`
+	RecoveryProbeEnabled            *bool   `json:"recovery_probe_enabled"`
+	RecoveryProbeMinIntervalSeconds *int    `json:"recovery_probe_min_interval_seconds"`
+	RecoveryProbeMaxConcurrency     *int    `json:"recovery_probe_max_concurrency"`
+	AllowRemoteMigration            *bool   `json:"allow_remote_migration"`
+	CPASyncEnabled                  *bool   `json:"cpa_sync_enabled"`
+	CPABaseURL                      *string `json:"cpa_base_url"`
+	CPAAdminKey                     *string `json:"cpa_admin_key"`
+	CPAMinAccounts                  *int    `json:"cpa_min_accounts"`
+	CPAMaxAccounts                  *int    `json:"cpa_max_accounts"`
+	CPAMaxUploadsPerHour            *int    `json:"cpa_max_uploads_per_hour"`
+	CPASwitchAfterUploads           *int    `json:"cpa_switch_after_uploads"`
+	CPASyncIntervalSeconds          *int    `json:"cpa_sync_interval_seconds"`
+	MihomoBaseURL                   *string `json:"mihomo_base_url"`
+	MihomoSecret                    *string `json:"mihomo_secret"`
+	MihomoStrategyGroup             *string `json:"mihomo_strategy_group"`
+	MihomoDelayTestURL              *string `json:"mihomo_delay_test_url"`
+	MihomoDelayTimeoutMs            *int    `json:"mihomo_delay_timeout_ms"`
+}
+
+type runtimeSettingsSnapshot struct {
+	maxConcurrency              int
+	globalRPM                   int
+	testModel                   string
+	testConcurrency             int
+	proxyURL                    string
+	proxyDefaultMode            string
+	proxyDynamicProviderURL     string
+	proxyDefaultProtocol        string
+	proxyRotationHours          int
+	pgMaxConns                  int
+	redisPoolSize               int
+	autoCleanUnauthorized       bool
+	autoCleanRateLimited        bool
+	autoCleanFullUsage          bool
+	autoCleanError              bool
+	autoCleanExpired            bool
+	proxyPoolEnabled            bool
+	maxRetries                  int
+	refreshScanEnabled          bool
+	refreshScanInterval         time.Duration
+	refreshPreExpireWindow      time.Duration
+	refreshMaxConcurrency       int
+	refreshOnImportEnabled      bool
+	refreshOnImportConcurrency  int
+	usageProbeEnabled           bool
+	usageProbeStaleAfter        time.Duration
+	usageProbeMaxConcurrency    int
+	recoveryProbeEnabled        bool
+	recoveryProbeMinInterval    time.Duration
+	recoveryProbeMaxConcurrency int
+	allowRemoteMigration        bool
+}
+
+func (h *Handler) captureRuntimeSettingsSnapshot() runtimeSettingsSnapshot {
+	return runtimeSettingsSnapshot{
+		maxConcurrency:              h.store.GetMaxConcurrency(),
+		globalRPM:                   h.rateLimiter.GetRPM(),
+		testModel:                   h.store.GetTestModel(),
+		testConcurrency:             h.store.GetTestConcurrency(),
+		proxyURL:                    h.store.GetProxyURL(),
+		proxyDefaultMode:            h.store.GetProxyMode(),
+		proxyDynamicProviderURL:     h.store.GetProxyProviderURL(),
+		proxyDefaultProtocol:        h.store.GetProxySchemeDefault(),
+		proxyRotationHours:          h.store.GetProxyRotationHours(),
+		pgMaxConns:                  h.pgMaxConns,
+		redisPoolSize:               h.redisPoolSize,
+		autoCleanUnauthorized:       h.store.GetAutoCleanUnauthorized(),
+		autoCleanRateLimited:        h.store.GetAutoCleanRateLimited(),
+		autoCleanFullUsage:          h.store.GetAutoCleanFullUsage(),
+		autoCleanError:              h.store.GetAutoCleanError(),
+		autoCleanExpired:            h.store.GetAutoCleanExpired(),
+		proxyPoolEnabled:            h.store.GetProxyPoolEnabled(),
+		maxRetries:                  h.store.GetMaxRetries(),
+		refreshScanEnabled:          h.store.GetRefreshScanEnabled(),
+		refreshScanInterval:         h.store.GetRefreshScanInterval(),
+		refreshPreExpireWindow:      h.store.GetRefreshPreExpireWindow(),
+		refreshMaxConcurrency:       h.store.GetRefreshMaxConcurrency(),
+		refreshOnImportEnabled:      h.store.GetRefreshOnImportEnabled(),
+		refreshOnImportConcurrency:  h.store.GetRefreshOnImportConcurrency(),
+		usageProbeEnabled:           h.store.GetUsageProbeEnabled(),
+		usageProbeStaleAfter:        h.store.GetUsageProbeStaleAfter(),
+		usageProbeMaxConcurrency:    h.store.GetUsageProbeMaxConcurrency(),
+		recoveryProbeEnabled:        h.store.GetRecoveryProbeEnabled(),
+		recoveryProbeMinInterval:    h.store.GetRecoveryProbeMinInterval(),
+		recoveryProbeMaxConcurrency: h.store.GetRecoveryProbeMaxConcurrency(),
+		allowRemoteMigration:        h.store.GetAllowRemoteMigration(),
+	}
+}
+
+func (h *Handler) restoreRuntimeSettingsSnapshot(snapshot runtimeSettingsSnapshot) {
+	h.store.SetMaxConcurrency(snapshot.maxConcurrency)
+	h.rateLimiter.UpdateRPM(snapshot.globalRPM)
+	h.store.SetTestModel(snapshot.testModel)
+	h.store.SetTestConcurrency(snapshot.testConcurrency)
+	h.store.SetProxyURL(snapshot.proxyURL)
+	h.store.SetProxyMode(snapshot.proxyDefaultMode)
+	h.store.SetProxyProviderURL(snapshot.proxyDynamicProviderURL)
+	h.store.SetProxySchemeDefault(snapshot.proxyDefaultProtocol)
+	h.store.SetProxyRotationHours(snapshot.proxyRotationHours)
+	h.db.SetMaxOpenConns(snapshot.pgMaxConns)
+	h.pgMaxConns = snapshot.pgMaxConns
+	h.cache.SetPoolSize(snapshot.redisPoolSize)
+	h.redisPoolSize = snapshot.redisPoolSize
+	h.store.SetAutoCleanUnauthorized(snapshot.autoCleanUnauthorized)
+	h.store.SetAutoCleanRateLimited(snapshot.autoCleanRateLimited)
+	h.store.SetAutoCleanFullUsage(snapshot.autoCleanFullUsage)
+	h.store.SetAutoCleanError(snapshot.autoCleanError)
+	h.store.SetAutoCleanExpired(snapshot.autoCleanExpired)
+	h.store.SetProxyPoolEnabled(snapshot.proxyPoolEnabled)
+	h.store.SetMaxRetries(snapshot.maxRetries)
+	h.store.SetRefreshScanEnabled(snapshot.refreshScanEnabled)
+	h.store.SetRefreshScanInterval(snapshot.refreshScanInterval)
+	h.store.SetRefreshPreExpireWindow(snapshot.refreshPreExpireWindow)
+	h.store.SetRefreshMaxConcurrency(snapshot.refreshMaxConcurrency)
+	h.store.SetRefreshOnImportEnabled(snapshot.refreshOnImportEnabled)
+	h.store.SetRefreshOnImportConcurrency(snapshot.refreshOnImportConcurrency)
+	h.store.SetUsageProbeEnabled(snapshot.usageProbeEnabled)
+	h.store.SetUsageProbeStaleAfter(snapshot.usageProbeStaleAfter)
+	h.store.SetUsageProbeMaxConcurrency(snapshot.usageProbeMaxConcurrency)
+	h.store.SetRecoveryProbeEnabled(snapshot.recoveryProbeEnabled)
+	h.store.SetRecoveryProbeMinInterval(snapshot.recoveryProbeMinInterval)
+	h.store.SetRecoveryProbeMaxConcurrency(snapshot.recoveryProbeMaxConcurrency)
+	h.store.SetAllowRemoteMigration(snapshot.allowRemoteMigration)
 }
 
 // GetSettings 获取当前系统设置
 func (h *Handler) GetSettings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
-	dbSettings, _ := h.db.GetSystemSettings(ctx)
+	dbSettings, err := h.db.GetSystemSettings(ctx)
+	if err != nil {
+		writeError(c, http.StatusServiceUnavailable, "读取系统设置失败")
+		return
+	}
 	if dbSettings == nil {
 		dbSettings = &database.SystemSettings{}
 	}
@@ -1791,42 +1933,56 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		adminSecret = dbSettings.AdminSecret
 	}
 	c.JSON(http.StatusOK, settingsResponse{
-		MaxConcurrency:         h.store.GetMaxConcurrency(),
-		GlobalRPM:              h.rateLimiter.GetRPM(),
-		TestModel:              h.store.GetTestModel(),
-		TestConcurrency:        h.store.GetTestConcurrency(),
-		ProxyURL:               h.store.GetProxyURL(),
-		PgMaxConns:             h.pgMaxConns,
-		RedisPoolSize:          h.redisPoolSize,
-		AutoCleanUnauthorized:  h.store.GetAutoCleanUnauthorized(),
-		AutoCleanRateLimited:   h.store.GetAutoCleanRateLimited(),
-		AdminSecret:            adminSecret,
-		AdminAuthSource:        adminAuthSource,
-		AutoCleanFullUsage:     h.store.GetAutoCleanFullUsage(),
-		AutoCleanError:         h.store.GetAutoCleanError(),
-		AutoCleanExpired:       h.store.GetAutoCleanExpired(),
-		ProxyPoolEnabled:       h.store.GetProxyPoolEnabled(),
-		FastSchedulerEnabled:   h.store.FastSchedulerEnabled(),
-		MaxRetries:             h.store.GetMaxRetries(),
-		AllowRemoteMigration:   h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
-		DatabaseDriver:         h.databaseDriver,
-		DatabaseLabel:          h.databaseLabel,
-		CacheDriver:            h.cacheDriver,
-		CacheLabel:             h.cacheLabel,
-		ModelMapping:           h.store.GetModelMapping(),
-		CPASyncEnabled:         dbSettings.CPASyncEnabled,
-		CPABaseURL:             dbSettings.CPABaseURL,
-		CPAAdminKey:            dbSettings.CPAAdminKey,
-		CPAMinAccounts:         dbSettings.CPAMinAccounts,
-		CPAMaxAccounts:         dbSettings.CPAMaxAccounts,
-		CPAMaxUploadsPerHour:   dbSettings.CPAMaxUploadsPerHour,
-		CPASwitchAfterUploads:  dbSettings.CPASwitchAfterUploads,
-		CPASyncIntervalSeconds: dbSettings.CPASyncIntervalSeconds,
-		MihomoBaseURL:          dbSettings.MihomoBaseURL,
-		MihomoSecret:           dbSettings.MihomoSecret,
-		MihomoStrategyGroup:    dbSettings.MihomoStrategyGroup,
-		MihomoDelayTestURL:     dbSettings.MihomoDelayTestURL,
-		MihomoDelayTimeoutMs:   dbSettings.MihomoDelayTimeoutMs,
+		MaxConcurrency:                  h.store.GetMaxConcurrency(),
+		GlobalRPM:                       h.rateLimiter.GetRPM(),
+		TestModel:                       h.store.GetTestModel(),
+		TestConcurrency:                 h.store.GetTestConcurrency(),
+		ProxyURL:                        h.store.GetProxyURL(),
+		ProxyDefaultMode:                h.store.GetProxyMode(),
+		ProxyDynamicProviderURL:         h.store.GetProxyProviderURL(),
+		ProxyDefaultProtocol:            h.store.GetProxySchemeDefault(),
+		ProxyRotationHours:              h.store.GetProxyRotationHours(),
+		PgMaxConns:                      h.pgMaxConns,
+		RedisPoolSize:                   h.redisPoolSize,
+		AutoCleanUnauthorized:           h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:            h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                     adminSecret,
+		AdminAuthSource:                 adminAuthSource,
+		AutoCleanFullUsage:              h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                  h.store.GetAutoCleanError(),
+		AutoCleanExpired:                h.store.GetAutoCleanExpired(),
+		ProxyPoolEnabled:                h.store.GetProxyPoolEnabled(),
+		MaxRetries:                      h.store.GetMaxRetries(),
+		RefreshScanEnabled:              h.store.GetRefreshScanEnabled(),
+		RefreshScanIntervalSeconds:      int(h.store.GetRefreshScanInterval().Seconds()),
+		RefreshPreExpireSeconds:         int(h.store.GetRefreshPreExpireWindow().Seconds()),
+		RefreshMaxConcurrency:           h.store.GetRefreshMaxConcurrency(),
+		RefreshOnImportEnabled:          h.store.GetRefreshOnImportEnabled(),
+		RefreshOnImportConcurrency:      h.store.GetRefreshOnImportConcurrency(),
+		UsageProbeEnabled:               h.store.GetUsageProbeEnabled(),
+		UsageProbeStaleAfterSeconds:     int(h.store.GetUsageProbeStaleAfter().Seconds()),
+		UsageProbeMaxConcurrency:        h.store.GetUsageProbeMaxConcurrency(),
+		RecoveryProbeEnabled:            h.store.GetRecoveryProbeEnabled(),
+		RecoveryProbeMinIntervalSeconds: int(h.store.GetRecoveryProbeMinInterval().Seconds()),
+		RecoveryProbeMaxConcurrency:     h.store.GetRecoveryProbeMaxConcurrency(),
+		AllowRemoteMigration:            h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
+		DatabaseDriver:                  h.databaseDriver,
+		DatabaseLabel:                   h.databaseLabel,
+		CacheDriver:                     h.cacheDriver,
+		CacheLabel:                      h.cacheLabel,
+		CPASyncEnabled:                  dbSettings.CPASyncEnabled,
+		CPABaseURL:                      dbSettings.CPABaseURL,
+		CPAAdminKey:                     dbSettings.CPAAdminKey,
+		CPAMinAccounts:                  dbSettings.CPAMinAccounts,
+		CPAMaxAccounts:                  dbSettings.CPAMaxAccounts,
+		CPAMaxUploadsPerHour:            dbSettings.CPAMaxUploadsPerHour,
+		CPASwitchAfterUploads:           dbSettings.CPASwitchAfterUploads,
+		CPASyncIntervalSeconds:          dbSettings.CPASyncIntervalSeconds,
+		MihomoBaseURL:                   dbSettings.MihomoBaseURL,
+		MihomoSecret:                    dbSettings.MihomoSecret,
+		MihomoStrategyGroup:             dbSettings.MihomoStrategyGroup,
+		MihomoDelayTestURL:              dbSettings.MihomoDelayTestURL,
+		MihomoDelayTimeoutMs:            dbSettings.MihomoDelayTimeoutMs,
 	})
 }
 
@@ -1839,7 +1995,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	existingSettings, err := h.db.GetSystemSettings(c.Request.Context())
-	if err != nil || existingSettings == nil {
+	if err != nil {
+		writeError(c, http.StatusServiceUnavailable, "系统设置不可用")
+		return
+	}
+	if existingSettings == nil {
 		existingSettings = &database.SystemSettings{}
 	}
 
@@ -1847,166 +2007,72 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
 			currentAdminSecret = *req.AdminSecret
-			log.Printf("设置已更新: admin_secret (长度=%d)", len(currentAdminSecret))
+			log.Printf("?????: admin_secret (??=%d)", len(currentAdminSecret))
 		} else {
-			log.Printf("检测到环境变量 ADMIN_SECRET，忽略前端提交的 admin_secret")
+			log.Printf("??????? ADMIN_SECRET???????? admin_secret")
 		}
 	}
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
 
-	if req.MaxConcurrency != nil {
-		v := *req.MaxConcurrency
-		if v < 1 {
-			v = 1
+	pendingProxyConfig := database.ProxyConfigInput{
+		Mode:        h.store.GetProxyMode(),
+		URL:         h.store.GetProxyURL(),
+		ProviderURL: h.store.GetProxyProviderURL(),
+		Scheme:      h.store.GetProxySchemeDefault(),
+	}
+	if req.ProxyURL != nil || req.ProxyDefaultMode != nil || req.ProxyDynamicProviderURL != nil || req.ProxyDefaultProtocol != nil || req.ProxyPoolEnabled != nil {
+		pendingProxyURL := pendingProxyConfig.URL
+		if req.ProxyURL != nil {
+			pendingProxyURL = *req.ProxyURL
 		}
-		if v > 50 {
-			v = 50
+		pendingProxyMode := pendingProxyConfig.Mode
+		if req.ProxyDefaultMode != nil {
+			pendingProxyMode = *req.ProxyDefaultMode
 		}
-		h.store.SetMaxConcurrency(v)
-		log.Printf("设置已更新: max_concurrency = %d", v)
-	}
-
-	if req.GlobalRPM != nil {
-		v := *req.GlobalRPM
-		if v < 0 {
-			v = 0
+		pendingProxyProviderURL := pendingProxyConfig.ProviderURL
+		if req.ProxyDynamicProviderURL != nil {
+			pendingProxyProviderURL = *req.ProxyDynamicProviderURL
 		}
-		h.rateLimiter.UpdateRPM(v)
-		log.Printf("设置已更新: global_rpm = %d", v)
-	}
-
-	if req.TestModel != nil && *req.TestModel != "" {
-		h.store.SetTestModel(*req.TestModel)
-		log.Printf("设置已更新: test_model = %s", *req.TestModel)
-	}
-
-	if req.TestConcurrency != nil {
-		v := *req.TestConcurrency
-		if v < 1 {
-			v = 1
+		pendingProxyScheme := pendingProxyConfig.Scheme
+		if req.ProxyDefaultProtocol != nil {
+			pendingProxyScheme = *req.ProxyDefaultProtocol
 		}
-		if v > 200 {
-			v = 200
+		pendingProxyPoolEnabled := h.store.GetProxyPoolEnabled()
+		if req.ProxyPoolEnabled != nil {
+			pendingProxyPoolEnabled = *req.ProxyPoolEnabled
 		}
-		h.store.SetTestConcurrency(v)
-		log.Printf("设置已更新: test_concurrency = %d", v)
-	}
-
-	if req.ProxyURL != nil {
-		h.store.SetProxyURL(*req.ProxyURL)
-		log.Printf("设置已更新: proxy_url = %s", *req.ProxyURL)
-	}
-
-	if req.PgMaxConns != nil {
-		v := *req.PgMaxConns
-		if v < 5 {
-			v = 5
-		}
-		if v > 500 {
-			v = 500
-		}
-		h.db.SetMaxOpenConns(v)
-		h.pgMaxConns = v
-		log.Printf("设置已更新: pg_max_conns = %d", v)
-	}
-
-	if req.RedisPoolSize != nil {
-		v := *req.RedisPoolSize
-		if v < 5 {
-			v = 5
-		}
-		if v > 500 {
-			v = 500
-		}
-		h.cache.SetPoolSize(v)
-		h.redisPoolSize = v
-		log.Printf("设置已更新: redis_pool_size = %d", v)
-	}
-
-	if req.AutoCleanUnauthorized != nil {
-		h.store.SetAutoCleanUnauthorized(*req.AutoCleanUnauthorized)
-		log.Printf("设置已更新: auto_clean_unauthorized = %t", *req.AutoCleanUnauthorized)
-	}
-
-	if req.AutoCleanRateLimited != nil {
-		h.store.SetAutoCleanRateLimited(*req.AutoCleanRateLimited)
-		log.Printf("设置已更新: auto_clean_rate_limited = %t", *req.AutoCleanRateLimited)
-	}
-
-	if req.AutoCleanFullUsage != nil {
-		h.store.SetAutoCleanFullUsage(*req.AutoCleanFullUsage)
-		log.Printf("设置已更新: auto_clean_full_usage = %t", *req.AutoCleanFullUsage)
-	}
-
-	if req.AutoCleanError != nil {
-		h.store.SetAutoCleanError(*req.AutoCleanError)
-		log.Printf("设置已更新: auto_clean_error = %t", *req.AutoCleanError)
-	}
-
-	var expiredCleaned int
-	if req.AutoCleanExpired != nil {
-		h.store.SetAutoCleanExpired(*req.AutoCleanExpired)
-		log.Printf("设置已更新: auto_clean_expired = %t", *req.AutoCleanExpired)
-		// 开启时立即同步执行一次清理
-		if *req.AutoCleanExpired {
-			expiredCleaned = h.store.CleanExpiredNow()
-		}
-	}
-
-	if req.ProxyPoolEnabled != nil {
-		h.store.SetProxyPoolEnabled(*req.ProxyPoolEnabled)
-		if *req.ProxyPoolEnabled {
-			_ = h.store.ReloadProxyPool()
-		}
-		log.Printf("设置已更新: proxy_pool_enabled = %t", *req.ProxyPoolEnabled)
-	}
-
-	if req.FastSchedulerEnabled != nil {
-		h.store.SetFastSchedulerEnabled(*req.FastSchedulerEnabled)
-		log.Printf("设置已更新: fast_scheduler_enabled = %t", *req.FastSchedulerEnabled)
-	}
-
-	if req.MaxRetries != nil {
-		v := *req.MaxRetries
-		if v < 0 {
-			v = 0
-		}
-		if v > 10 {
-			v = 10
-		}
-		h.store.SetMaxRetries(v)
-		log.Printf("设置已更新: max_retries = %d", v)
-	}
-
-	if req.AllowRemoteMigration != nil {
-		if *req.AllowRemoteMigration && !hasAdminSecret {
-			writeError(c, http.StatusBadRequest, "请先设置管理密钥，再启用远程迁移")
+		pendingProxyConfig, err = buildProxyConfigInput(pendingProxyMode, pendingProxyURL, pendingProxyProviderURL, pendingProxyScheme, pendingProxyPoolEnabled, false)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
 			return
 		}
-		h.store.SetAllowRemoteMigration(*req.AllowRemoteMigration)
-		log.Printf("设置已更新: allow_remote_migration = %t", *req.AllowRemoteMigration)
-	} else if !hasAdminSecret {
-		h.store.SetAllowRemoteMigration(false)
 	}
 
-	if req.ModelMapping != nil {
-		h.store.SetModelMapping(*req.ModelMapping)
-		log.Printf("设置已更新: model_mapping")
+	if req.AllowRemoteMigration != nil && *req.AllowRemoteMigration && !hasAdminSecret {
+		writeError(c, http.StatusBadRequest, "启用远程迁移前请先设置管理员密钥")
+		return
 	}
 
-	// 持久化保存到数据库
 	cpaSyncEnabled := existingSettings.CPASyncEnabled
 	if req.CPASyncEnabled != nil {
 		cpaSyncEnabled = *req.CPASyncEnabled
 	}
+
 	cpaBaseURL := existingSettings.CPABaseURL
 	if req.CPABaseURL != nil {
-		cpaBaseURL = strings.TrimSpace(*req.CPABaseURL)
+		sanitized, err := validateExternalServiceBaseURL(c.Request.Context(), *req.CPABaseURL, "cpa_base_url")
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		cpaBaseURL = sanitized
 	}
+
 	cpaAdminKey := existingSettings.CPAAdminKey
 	if req.CPAAdminKey != nil {
 		cpaAdminKey = strings.TrimSpace(*req.CPAAdminKey)
 	}
+
 	cpaMinAccounts := existingSettings.CPAMinAccounts
 	if req.CPAMinAccounts != nil {
 		cpaMinAccounts = *req.CPAMinAccounts
@@ -2014,6 +2080,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			cpaMinAccounts = 0
 		}
 	}
+
 	cpaMaxAccounts := existingSettings.CPAMaxAccounts
 	if req.CPAMaxAccounts != nil {
 		cpaMaxAccounts = *req.CPAMaxAccounts
@@ -2021,6 +2088,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			cpaMaxAccounts = 0
 		}
 	}
+
 	cpaMaxUploadsPerHour := existingSettings.CPAMaxUploadsPerHour
 	if req.CPAMaxUploadsPerHour != nil {
 		cpaMaxUploadsPerHour = *req.CPAMaxUploadsPerHour
@@ -2028,6 +2096,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			cpaMaxUploadsPerHour = 0
 		}
 	}
+
 	cpaSwitchAfterUploads := existingSettings.CPASwitchAfterUploads
 	if req.CPASwitchAfterUploads != nil {
 		cpaSwitchAfterUploads = *req.CPASwitchAfterUploads
@@ -2035,6 +2104,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			cpaSwitchAfterUploads = 0
 		}
 	}
+
 	cpaSyncIntervalSeconds := existingSettings.CPASyncIntervalSeconds
 	if cpaSyncIntervalSeconds <= 0 {
 		cpaSyncIntervalSeconds = 300
@@ -2048,22 +2118,37 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			cpaSyncIntervalSeconds = 86400
 		}
 	}
+
 	mihomoBaseURL := existingSettings.MihomoBaseURL
 	if req.MihomoBaseURL != nil {
-		mihomoBaseURL = strings.TrimSpace(*req.MihomoBaseURL)
+		sanitized, err := validateExternalServiceBaseURL(c.Request.Context(), *req.MihomoBaseURL, "mihomo_base_url")
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		mihomoBaseURL = sanitized
 	}
+
 	mihomoSecret := existingSettings.MihomoSecret
 	if req.MihomoSecret != nil {
 		mihomoSecret = strings.TrimSpace(*req.MihomoSecret)
 	}
+
 	mihomoStrategyGroup := existingSettings.MihomoStrategyGroup
 	if req.MihomoStrategyGroup != nil {
 		mihomoStrategyGroup = strings.TrimSpace(*req.MihomoStrategyGroup)
 	}
+
 	mihomoDelayTestURL := existingSettings.MihomoDelayTestURL
 	if req.MihomoDelayTestURL != nil {
-		mihomoDelayTestURL = strings.TrimSpace(*req.MihomoDelayTestURL)
+		sanitized, err := validateExternalTargetURL(c.Request.Context(), *req.MihomoDelayTestURL, "mihomo_delay_test_url")
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		mihomoDelayTestURL = sanitized
 	}
+
 	mihomoDelayTimeoutMs := existingSettings.MihomoDelayTimeoutMs
 	if mihomoDelayTimeoutMs <= 0 {
 		mihomoDelayTimeoutMs = 5000
@@ -2078,41 +2163,248 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 	}
 
+	runtimeSnapshot := h.captureRuntimeSettingsSnapshot()
+	proxyPoolReloadNeeded := false
+	expiredCleanRequested := false
+
+	if req.MaxConcurrency != nil {
+		v := *req.MaxConcurrency
+		if v < 1 {
+			v = 1
+		}
+		if v > 50 {
+			v = 50
+		}
+		h.store.SetMaxConcurrency(v)
+		log.Printf("?????: max_concurrency = %d", v)
+	}
+
+	if req.GlobalRPM != nil {
+		v := *req.GlobalRPM
+		if v < 0 {
+			v = 0
+		}
+		h.rateLimiter.UpdateRPM(v)
+		log.Printf("?????: global_rpm = %d", v)
+	}
+
+	if req.TestModel != nil && *req.TestModel != "" {
+		h.store.SetTestModel(*req.TestModel)
+		log.Printf("?????: test_model = %s", *req.TestModel)
+	}
+
+	if req.TestConcurrency != nil {
+		v := *req.TestConcurrency
+		if v < 1 {
+			v = 1
+		}
+		if v > 200 {
+			v = 200
+		}
+		h.store.SetTestConcurrency(v)
+		log.Printf("?????: test_concurrency = %d", v)
+	}
+
+	if req.ProxyURL != nil || req.ProxyDefaultMode != nil || req.ProxyDynamicProviderURL != nil || req.ProxyDefaultProtocol != nil || req.ProxyPoolEnabled != nil {
+		if req.ProxyURL != nil {
+			h.store.SetProxyURL(pendingProxyConfig.URL)
+			log.Printf("?????: proxy_url = %s", security.SanitizeLog(pendingProxyConfig.URL))
+		}
+		h.store.SetProxyMode(pendingProxyConfig.Mode)
+		if req.ProxyDynamicProviderURL != nil {
+			h.store.SetProxyProviderURL(pendingProxyConfig.ProviderURL)
+		}
+		if req.ProxyDefaultProtocol != nil {
+			h.store.SetProxySchemeDefault(pendingProxyConfig.Scheme)
+		}
+	}
+
+	if req.ProxyRotationHours != nil {
+		v := *req.ProxyRotationHours
+		if v < 1 {
+			v = 1
+		}
+		if v > 24*30 {
+			v = 24 * 30
+		}
+		h.store.SetProxyRotationHours(v)
+	}
+
+	if req.PgMaxConns != nil {
+		v := *req.PgMaxConns
+		if v < 5 {
+			v = 5
+		}
+		if v > 500 {
+			v = 500
+		}
+		h.db.SetMaxOpenConns(v)
+		h.pgMaxConns = v
+		log.Printf("?????: pg_max_conns = %d", v)
+	}
+
+	if req.RedisPoolSize != nil {
+		v := *req.RedisPoolSize
+		if v < 5 {
+			v = 5
+		}
+		if v > 500 {
+			v = 500
+		}
+		h.cache.SetPoolSize(v)
+		h.redisPoolSize = v
+		log.Printf("?????: redis_pool_size = %d", v)
+	}
+
+	if req.AutoCleanUnauthorized != nil {
+		h.store.SetAutoCleanUnauthorized(*req.AutoCleanUnauthorized)
+		log.Printf("?????: auto_clean_unauthorized = %t", *req.AutoCleanUnauthorized)
+	}
+
+	if req.AutoCleanRateLimited != nil {
+		h.store.SetAutoCleanRateLimited(*req.AutoCleanRateLimited)
+		log.Printf("?????: auto_clean_rate_limited = %t", *req.AutoCleanRateLimited)
+	}
+
+	if req.AutoCleanFullUsage != nil {
+		h.store.SetAutoCleanFullUsage(*req.AutoCleanFullUsage)
+		log.Printf("?????: auto_clean_full_usage = %t", *req.AutoCleanFullUsage)
+	}
+
+	if req.AutoCleanError != nil {
+		h.store.SetAutoCleanError(*req.AutoCleanError)
+		log.Printf("?????: auto_clean_error = %t", *req.AutoCleanError)
+	}
+
+	var expiredCleaned int
+	if req.AutoCleanExpired != nil {
+		h.store.SetAutoCleanExpired(*req.AutoCleanExpired)
+		log.Printf("?????: auto_clean_expired = %t", *req.AutoCleanExpired)
+		expiredCleanRequested = *req.AutoCleanExpired
+	}
+
+	if req.ProxyPoolEnabled != nil {
+		h.store.SetProxyPoolEnabled(*req.ProxyPoolEnabled)
+		proxyPoolReloadNeeded = *req.ProxyPoolEnabled
+		log.Printf("?????: proxy_pool_enabled = %t", *req.ProxyPoolEnabled)
+	}
+
+	if req.MaxRetries != nil {
+		v := *req.MaxRetries
+		if v < 0 {
+			v = 0
+		}
+		if v > 10 {
+			v = 10
+		}
+		h.store.SetMaxRetries(v)
+		log.Printf("?????: max_retries = %d", v)
+	}
+
+	if req.RefreshScanEnabled != nil {
+		h.store.SetRefreshScanEnabled(*req.RefreshScanEnabled)
+	}
+	if req.RefreshScanIntervalSeconds != nil {
+		h.store.SetRefreshScanInterval(time.Duration(*req.RefreshScanIntervalSeconds) * time.Second)
+	}
+	if req.RefreshPreExpireSeconds != nil {
+		h.store.SetRefreshPreExpireWindow(time.Duration(*req.RefreshPreExpireSeconds) * time.Second)
+	}
+	if req.RefreshMaxConcurrency != nil {
+		h.store.SetRefreshMaxConcurrency(*req.RefreshMaxConcurrency)
+	}
+	if req.RefreshOnImportEnabled != nil {
+		h.store.SetRefreshOnImportEnabled(*req.RefreshOnImportEnabled)
+	}
+	if req.RefreshOnImportConcurrency != nil {
+		h.store.SetRefreshOnImportConcurrency(*req.RefreshOnImportConcurrency)
+	}
+	if req.UsageProbeEnabled != nil {
+		h.store.SetUsageProbeEnabled(*req.UsageProbeEnabled)
+	}
+	if req.UsageProbeStaleAfterSeconds != nil {
+		h.store.SetUsageProbeStaleAfter(time.Duration(*req.UsageProbeStaleAfterSeconds) * time.Second)
+	}
+	if req.UsageProbeMaxConcurrency != nil {
+		h.store.SetUsageProbeMaxConcurrency(*req.UsageProbeMaxConcurrency)
+	}
+	if req.RecoveryProbeEnabled != nil {
+		h.store.SetRecoveryProbeEnabled(*req.RecoveryProbeEnabled)
+	}
+	if req.RecoveryProbeMinIntervalSeconds != nil {
+		h.store.SetRecoveryProbeMinInterval(time.Duration(*req.RecoveryProbeMinIntervalSeconds) * time.Second)
+	}
+	if req.RecoveryProbeMaxConcurrency != nil {
+		h.store.SetRecoveryProbeMaxConcurrency(*req.RecoveryProbeMaxConcurrency)
+	}
+
+	if req.AllowRemoteMigration != nil {
+		h.store.SetAllowRemoteMigration(*req.AllowRemoteMigration)
+		log.Printf("?????: allow_remote_migration = %t", *req.AllowRemoteMigration)
+	} else if !hasAdminSecret {
+		h.store.SetAllowRemoteMigration(false)
+	}
+
 	err = h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
-		MaxConcurrency:         h.store.GetMaxConcurrency(),
-		GlobalRPM:              h.rateLimiter.GetRPM(),
-		TestModel:              h.store.GetTestModel(),
-		TestConcurrency:        h.store.GetTestConcurrency(),
-		ProxyURL:               h.store.GetProxyURL(),
-		PgMaxConns:             h.pgMaxConns,
-		RedisPoolSize:          h.redisPoolSize,
-		AutoCleanUnauthorized:  h.store.GetAutoCleanUnauthorized(),
-		AutoCleanRateLimited:   h.store.GetAutoCleanRateLimited(),
-		AdminSecret:            currentAdminSecret,
-		AutoCleanFullUsage:     h.store.GetAutoCleanFullUsage(),
-		AutoCleanError:         h.store.GetAutoCleanError(),
-		AutoCleanExpired:       h.store.GetAutoCleanExpired(),
-		ProxyPoolEnabled:       h.store.GetProxyPoolEnabled(),
-		FastSchedulerEnabled:   h.store.FastSchedulerEnabled(),
-		MaxRetries:             h.store.GetMaxRetries(),
-		AllowRemoteMigration:   h.store.GetAllowRemoteMigration() && hasAdminSecret,
-		ModelMapping:           h.store.GetModelMapping(),
-		CPASyncEnabled:         cpaSyncEnabled,
-		CPABaseURL:             cpaBaseURL,
-		CPAAdminKey:            cpaAdminKey,
-		CPAMinAccounts:         cpaMinAccounts,
-		CPAMaxAccounts:         cpaMaxAccounts,
-		CPAMaxUploadsPerHour:   cpaMaxUploadsPerHour,
-		CPASwitchAfterUploads:  cpaSwitchAfterUploads,
-		CPASyncIntervalSeconds: cpaSyncIntervalSeconds,
-		MihomoBaseURL:          mihomoBaseURL,
-		MihomoSecret:           mihomoSecret,
-		MihomoStrategyGroup:    mihomoStrategyGroup,
-		MihomoDelayTestURL:     mihomoDelayTestURL,
-		MihomoDelayTimeoutMs:   mihomoDelayTimeoutMs,
+		MaxConcurrency:                  h.store.GetMaxConcurrency(),
+		GlobalRPM:                       h.rateLimiter.GetRPM(),
+		TestModel:                       h.store.GetTestModel(),
+		TestConcurrency:                 h.store.GetTestConcurrency(),
+		ProxyURL:                        h.store.GetProxyURL(),
+		ProxyMode:                       h.store.GetProxyMode(),
+		ProxyProviderURL:                h.store.GetProxyProviderURL(),
+		ProxySchemeDefault:              h.store.GetProxySchemeDefault(),
+		ProxyRotationHours:              h.store.GetProxyRotationHours(),
+		PgMaxConns:                      h.pgMaxConns,
+		RedisPoolSize:                   h.redisPoolSize,
+		AutoCleanUnauthorized:           h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:            h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                     currentAdminSecret,
+		AutoCleanFullUsage:              h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                  h.store.GetAutoCleanError(),
+		AutoCleanExpired:                h.store.GetAutoCleanExpired(),
+		ProxyPoolEnabled:                h.store.GetProxyPoolEnabled(),
+		MaxRetries:                      h.store.GetMaxRetries(),
+		RefreshScanEnabled:              h.store.GetRefreshScanEnabled(),
+		RefreshScanIntervalSeconds:      int(h.store.GetRefreshScanInterval().Seconds()),
+		RefreshPreExpireSeconds:         int(h.store.GetRefreshPreExpireWindow().Seconds()),
+		RefreshMaxConcurrency:           h.store.GetRefreshMaxConcurrency(),
+		RefreshOnImportEnabled:          h.store.GetRefreshOnImportEnabled(),
+		RefreshOnImportConcurrency:      h.store.GetRefreshOnImportConcurrency(),
+		UsageProbeEnabled:               h.store.GetUsageProbeEnabled(),
+		UsageProbeStaleAfterSeconds:     int(h.store.GetUsageProbeStaleAfter().Seconds()),
+		UsageProbeMaxConcurrency:        h.store.GetUsageProbeMaxConcurrency(),
+		RecoveryProbeEnabled:            h.store.GetRecoveryProbeEnabled(),
+		RecoveryProbeMinIntervalSeconds: int(h.store.GetRecoveryProbeMinInterval().Seconds()),
+		RecoveryProbeMaxConcurrency:     h.store.GetRecoveryProbeMaxConcurrency(),
+		AllowRemoteMigration:            h.store.GetAllowRemoteMigration() && hasAdminSecret,
+		ModelMapping:                    h.store.GetModelMapping(),
+		CPASyncEnabled:                  cpaSyncEnabled,
+		CPABaseURL:                      cpaBaseURL,
+		CPAAdminKey:                     cpaAdminKey,
+		CPAMinAccounts:                  cpaMinAccounts,
+		CPAMaxAccounts:                  cpaMaxAccounts,
+		CPAMaxUploadsPerHour:            cpaMaxUploadsPerHour,
+		CPASwitchAfterUploads:           cpaSwitchAfterUploads,
+		CPASyncIntervalSeconds:          cpaSyncIntervalSeconds,
+		MihomoBaseURL:                   mihomoBaseURL,
+		MihomoSecret:                    mihomoSecret,
+		MihomoStrategyGroup:             mihomoStrategyGroup,
+		MihomoDelayTestURL:              mihomoDelayTestURL,
+		MihomoDelayTimeoutMs:            mihomoDelayTimeoutMs,
 	})
 	if err != nil {
-		log.Printf("无法持久化保存设置: %v", err)
+		h.restoreRuntimeSettingsSnapshot(runtimeSnapshot)
+		log.Printf("?????????: %v", err)
+		writeError(c, http.StatusServiceUnavailable, "保存系统设置失败")
+		return
+	}
+
+	if proxyPoolReloadNeeded {
+		_ = h.store.ReloadProxyPool()
+	}
+	if expiredCleanRequested {
+		expiredCleaned = h.store.CleanExpiredNow()
 	}
 
 	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {
@@ -2132,47 +2424,59 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, settingsResponse{
-		MaxConcurrency:         h.store.GetMaxConcurrency(),
-		GlobalRPM:              h.rateLimiter.GetRPM(),
-		TestModel:              h.store.GetTestModel(),
-		TestConcurrency:        h.store.GetTestConcurrency(),
-		ProxyURL:               h.store.GetProxyURL(),
-		PgMaxConns:             h.pgMaxConns,
-		RedisPoolSize:          h.redisPoolSize,
-		AutoCleanUnauthorized:  h.store.GetAutoCleanUnauthorized(),
-		AutoCleanRateLimited:   h.store.GetAutoCleanRateLimited(),
-		AdminSecret:            adminSecretForDisplay,
-		AdminAuthSource:        adminAuthSource,
-		AutoCleanFullUsage:     h.store.GetAutoCleanFullUsage(),
-		AutoCleanError:         h.store.GetAutoCleanError(),
-		AutoCleanExpired:       h.store.GetAutoCleanExpired(),
-		ProxyPoolEnabled:       h.store.GetProxyPoolEnabled(),
-		FastSchedulerEnabled:   h.store.FastSchedulerEnabled(),
-		MaxRetries:             h.store.GetMaxRetries(),
-		AllowRemoteMigration:   h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
-		DatabaseDriver:         h.databaseDriver,
-		DatabaseLabel:          h.databaseLabel,
-		CacheDriver:            h.cacheDriver,
-		CacheLabel:             h.cacheLabel,
-		ExpiredCleaned:         expiredCleaned,
-		ModelMapping:           h.store.GetModelMapping(),
-		CPASyncEnabled:         cpaSyncEnabled,
-		CPABaseURL:             cpaBaseURL,
-		CPAAdminKey:            cpaAdminKey,
-		CPAMinAccounts:         cpaMinAccounts,
-		CPAMaxAccounts:         cpaMaxAccounts,
-		CPAMaxUploadsPerHour:   cpaMaxUploadsPerHour,
-		CPASwitchAfterUploads:  cpaSwitchAfterUploads,
-		CPASyncIntervalSeconds: cpaSyncIntervalSeconds,
-		MihomoBaseURL:          mihomoBaseURL,
-		MihomoSecret:           mihomoSecret,
-		MihomoStrategyGroup:    mihomoStrategyGroup,
-		MihomoDelayTestURL:     mihomoDelayTestURL,
-		MihomoDelayTimeoutMs:   mihomoDelayTimeoutMs,
+		MaxConcurrency:                  h.store.GetMaxConcurrency(),
+		GlobalRPM:                       h.rateLimiter.GetRPM(),
+		TestModel:                       h.store.GetTestModel(),
+		TestConcurrency:                 h.store.GetTestConcurrency(),
+		ProxyURL:                        h.store.GetProxyURL(),
+		ProxyDefaultMode:                h.store.GetProxyMode(),
+		ProxyDynamicProviderURL:         h.store.GetProxyProviderURL(),
+		ProxyDefaultProtocol:            h.store.GetProxySchemeDefault(),
+		ProxyRotationHours:              h.store.GetProxyRotationHours(),
+		PgMaxConns:                      h.pgMaxConns,
+		RedisPoolSize:                   h.redisPoolSize,
+		AutoCleanUnauthorized:           h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:            h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                     adminSecretForDisplay,
+		AdminAuthSource:                 adminAuthSource,
+		AutoCleanFullUsage:              h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                  h.store.GetAutoCleanError(),
+		AutoCleanExpired:                h.store.GetAutoCleanExpired(),
+		ProxyPoolEnabled:                h.store.GetProxyPoolEnabled(),
+		MaxRetries:                      h.store.GetMaxRetries(),
+		RefreshScanEnabled:              h.store.GetRefreshScanEnabled(),
+		RefreshScanIntervalSeconds:      int(h.store.GetRefreshScanInterval().Seconds()),
+		RefreshPreExpireSeconds:         int(h.store.GetRefreshPreExpireWindow().Seconds()),
+		RefreshMaxConcurrency:           h.store.GetRefreshMaxConcurrency(),
+		RefreshOnImportEnabled:          h.store.GetRefreshOnImportEnabled(),
+		RefreshOnImportConcurrency:      h.store.GetRefreshOnImportConcurrency(),
+		UsageProbeEnabled:               h.store.GetUsageProbeEnabled(),
+		UsageProbeStaleAfterSeconds:     int(h.store.GetUsageProbeStaleAfter().Seconds()),
+		UsageProbeMaxConcurrency:        h.store.GetUsageProbeMaxConcurrency(),
+		RecoveryProbeEnabled:            h.store.GetRecoveryProbeEnabled(),
+		RecoveryProbeMinIntervalSeconds: int(h.store.GetRecoveryProbeMinInterval().Seconds()),
+		RecoveryProbeMaxConcurrency:     h.store.GetRecoveryProbeMaxConcurrency(),
+		AllowRemoteMigration:            h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
+		DatabaseDriver:                  h.databaseDriver,
+		DatabaseLabel:                   h.databaseLabel,
+		CacheDriver:                     h.cacheDriver,
+		CacheLabel:                      h.cacheLabel,
+		ExpiredCleaned:                  expiredCleaned,
+		CPASyncEnabled:                  cpaSyncEnabled,
+		CPABaseURL:                      cpaBaseURL,
+		CPAAdminKey:                     cpaAdminKey,
+		CPAMinAccounts:                  cpaMinAccounts,
+		CPAMaxAccounts:                  cpaMaxAccounts,
+		CPAMaxUploadsPerHour:            cpaMaxUploadsPerHour,
+		CPASwitchAfterUploads:           cpaSwitchAfterUploads,
+		CPASyncIntervalSeconds:          cpaSyncIntervalSeconds,
+		MihomoBaseURL:                   mihomoBaseURL,
+		MihomoSecret:                    mihomoSecret,
+		MihomoStrategyGroup:             mihomoStrategyGroup,
+		MihomoDelayTestURL:              mihomoDelayTestURL,
+		MihomoDelayTimeoutMs:            mihomoDelayTimeoutMs,
 	})
 }
-
-// ==================== 导出 & 迁移 ====================
 
 type cpaExportEntry struct {
 	Type         string `json:"type"`
@@ -2208,7 +2512,7 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 
 	rows, err := h.db.ListActive(ctx)
 	if err != nil {
-		writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+		writeLoggedInternalError(c, "查询账号失败", err)
 		return
 	}
 
@@ -2271,6 +2575,11 @@ type migrateReq struct {
 
 // MigrateAccounts 从远程 codex2api 实例迁移健康账号（SSE 流式进度）
 func (h *Handler) MigrateAccounts(c *gin.Context) {
+	const (
+		maxMigrateErrorBodyBytes = 256 * 1024
+		maxMigratePayloadBytes   = 20 * 1024 * 1024
+	)
+
 	if !h.hasConfiguredAdminSecret(c.Request.Context()) {
 		writeError(c, http.StatusForbidden, "请先设置管理密钥，再使用远程迁移")
 		return
@@ -2286,7 +2595,11 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 		return
 	}
 
-	remoteURL := strings.TrimRight(req.URL, "/")
+	remoteURL, err := validateMigrationRemoteURL(c.Request.Context(), req.URL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "远程实例 URL 无效: "+err.Error())
+		return
+	}
 	exportURL := remoteURL + "/api/admin/accounts/export?filter=healthy&remote=true"
 
 	fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -2294,27 +2607,36 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 
 	httpReq, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, exportURL, nil)
 	if err != nil {
-		writeError(c, http.StatusBadRequest, "构建请求失败: "+err.Error())
+		writeLoggedInternalError(c, "构建远程迁移请求失败", err)
 		return
 	}
 	httpReq.Header.Set("X-Admin-Key", req.AdminKey)
 
-	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(httpReq)
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return fmt.Errorf("禁止重定向")
+		},
+	}
+	resp, err := client.Do(httpReq)
 	if err != nil {
-		writeError(c, http.StatusBadGateway, "连接远程实例失败: "+err.Error())
+		log.Printf("[admin] 连接远程实例失败: %v", err)
+		writeError(c, http.StatusBadGateway, "连接远程实例失败")
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		writeError(c, http.StatusBadGateway, fmt.Sprintf("远程实例返回错误 (%d): %s", resp.StatusCode, string(body)))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxMigrateErrorBodyBytes))
+		log.Printf("[admin] 远程实例返回错误 (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		writeError(c, http.StatusBadGateway, fmt.Sprintf("远程实例返回错误 (%d)", resp.StatusCode))
 		return
 	}
 
 	var remoteAccounts []cpaExportEntry
-	if err := json.NewDecoder(resp.Body).Decode(&remoteAccounts); err != nil {
-		writeError(c, http.StatusBadGateway, "解析远程数据失败: "+err.Error())
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxMigratePayloadBytes)).Decode(&remoteAccounts); err != nil {
+		log.Printf("[admin] 解析远程迁移数据失败: %v", err)
+		writeError(c, http.StatusBadGateway, "解析远程数据失败")
 		return
 	}
 
@@ -2338,7 +2660,7 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 	}
 
 	log.Printf("远程迁移: 从 %s 拉取到 %d 个账号，开始导入", remoteURL, len(tokens))
-	h.importAccountsCommon(c, tokens, "")
+	h.importAccountsCommon(c, tokens, database.ProxyConfigInput{})
 }
 
 // ==================== Models ====================
@@ -2382,7 +2704,7 @@ func (h *Handler) GetAccountEventTrend(c *gin.Context) {
 
 	trend, err := h.db.GetAccountEventTrend(ctx, start, end, bucketMinutes)
 	if err != nil {
-		writeInternalError(c, err)
+		writeLoggedInternalError(c, "获取账号趋势失败", err)
 		return
 	}
 
@@ -2431,15 +2753,43 @@ func (h *Handler) ListProxies(c *gin.Context) {
 	if proxies == nil {
 		proxies = []*database.ProxyRow{}
 	}
-	c.JSON(http.StatusOK, gin.H{"proxies": proxies})
+	items := make([]gin.H, 0, len(proxies))
+	for _, p := range proxies {
+		items = append(items, gin.H{
+			"id":                      p.ID,
+			"url":                     p.URL,
+			"label":                   p.Label,
+			"enabled":                 p.Enabled,
+			"source_type":             p.SourceType,
+			"provider_url":            p.ProviderURL,
+			"scheme_default":          p.SchemeDefault,
+			"last_resolved_proxy_url": p.LastResolvedProxyURL,
+			"last_resolved_proxy":     p.LastResolvedProxyURL,
+			"last_resolved_at": func() string {
+				if p.LastResolvedAt.IsZero() {
+					return ""
+				}
+				return p.LastResolvedAt.Format(time.RFC3339)
+			}(),
+			"last_error":      p.LastError,
+			"created_at":      p.CreatedAt.Format(time.RFC3339),
+			"test_ip":         p.TestIP,
+			"test_location":   p.TestLocation,
+			"test_latency_ms": p.TestLatencyMs,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"proxies": items})
 }
 
 // AddProxies 添加代理（支持批量）
 func (h *Handler) AddProxies(c *gin.Context) {
 	var req struct {
-		URLs  []string `json:"urls"`
-		URL   string   `json:"url"`
-		Label string   `json:"label"`
+		URLs          []string `json:"urls"`
+		URL           string   `json:"url"`
+		Label         string   `json:"label"`
+		SourceType    string   `json:"source_type"`
+		ProviderURL   string   `json:"provider_url"`
+		SchemeDefault string   `json:"scheme_default"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
@@ -2464,14 +2814,37 @@ func (h *Handler) AddProxies(c *gin.Context) {
 			cleaned = append(cleaned, u)
 		}
 	}
+	if len(cleaned) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供至少一个代理 URL")
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	inserted, err := h.db.InsertProxies(ctx, cleaned, req.Label)
-	if err != nil {
-		writeError(c, http.StatusInternalServerError, "添加代理失败")
-		return
+	inserted := 0
+	var err error
+	sourceType := strings.ToLower(strings.TrimSpace(req.SourceType))
+	if sourceType == "" {
+		sourceType = auth.ProxyModeStatic
+	}
+	if sourceType == auth.ProxyModeDynamic {
+		cfg, err := buildProxyConfigInput(sourceType, req.URL, req.ProviderURL, req.SchemeDefault, false, false)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "代理配置无效: "+err.Error())
+			return
+		}
+		if _, err := h.db.InsertProxyWithConfig(ctx, cfg, req.Label); err != nil {
+			writeError(c, http.StatusInternalServerError, "添加代理失败")
+			return
+		}
+		inserted = 1
+	} else {
+		inserted, err = h.db.InsertProxies(ctx, cleaned, req.Label)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "添加代理失败")
+			return
+		}
 	}
 
 	// 刷新代理池
@@ -2496,6 +2869,10 @@ func (h *Handler) DeleteProxy(c *gin.Context) {
 	defer cancel()
 
 	if err := h.db.DeleteProxy(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "代理不存在")
+			return
+		}
 		writeError(c, http.StatusInternalServerError, "删除代理失败")
 		return
 	}
@@ -2513,8 +2890,12 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 	}
 
 	var req struct {
-		Label   *string `json:"label"`
-		Enabled *bool   `json:"enabled"`
+		Label         *string `json:"label"`
+		Enabled       *bool   `json:"enabled"`
+		SourceType    *string `json:"source_type"`
+		ProviderURL   *string `json:"provider_url"`
+		SchemeDefault *string `json:"scheme_default"`
+		URL           *string `json:"url"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
@@ -2524,7 +2905,35 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if err := h.db.UpdateProxy(ctx, id, req.Label, req.Enabled); err != nil {
+	if req.ProviderURL != nil {
+		trimmed := strings.TrimSpace(*req.ProviderURL)
+		sanitized, err := sanitizeProxyProviderURL(trimmed)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "动态代理 URL 无效")
+			return
+		}
+		req.ProviderURL = &sanitized
+	}
+	if req.SchemeDefault != nil {
+		normalized := auth.NormalizeProxyScheme(*req.SchemeDefault)
+		req.SchemeDefault = &normalized
+	}
+	if req.URL != nil {
+		trimmed := strings.TrimSpace(*req.URL)
+		req.URL = &trimmed
+		if trimmed != "" {
+			if err := security.ValidateProxyURL(trimmed); err != nil {
+				writeError(c, http.StatusBadRequest, "代理 URL 无效")
+				return
+			}
+		}
+	}
+
+	if err := h.db.UpdateProxyWithConfig(ctx, id, req.Label, req.Enabled, req.SourceType, req.ProviderURL, req.SchemeDefault, req.URL); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "代理不存在")
+			return
+		}
 		writeError(c, http.StatusInternalServerError, "更新代理失败")
 		return
 	}
@@ -2573,7 +2982,8 @@ func (h *Handler) TestProxy(c *gin.Context) {
 	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport.DialContext = baseDialer.DialContext
 	if err := auth.ConfigureTransportProxy(transport, req.URL, baseDialer); err != nil {
-		c.JSON(http.StatusOK, gin.H{"success": false, "error": fmt.Sprintf("代理 URL 格式错误: %v", err)})
+		log.Printf("[admin] test proxy invalid url=%q: %v", req.URL, err)
+		c.JSON(http.StatusOK, gin.H{"success": false, "error": "代理 URL 格式错误"})
 		return
 	}
 	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
@@ -2583,20 +2993,22 @@ func (h *Handler) TestProxy(c *gin.Context) {
 		apiLang = "en"
 	}
 	start := time.Now()
-	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/?lang=%s&fields=status,message,country,regionName,city,isp,query", apiLang))
+	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/?lang=%s&fields=status,message,country,regionName,city,isp,query", neturl.QueryEscape(apiLang)))
 	latencyMs := int(time.Since(start).Milliseconds())
 
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"success": false, "error": fmt.Sprintf("连接失败: %v", err), "latency_ms": latencyMs})
+		log.Printf("[admin] test proxy connection failed url=%q: %v", req.URL, err)
+		c.JSON(http.StatusOK, gin.H{"success": false, "error": "连接失败", "latency_ms": latencyMs})
 		return
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 	result := gjson.ParseBytes(body)
 
 	if result.Get("status").String() != "success" {
-		c.JSON(http.StatusOK, gin.H{"success": false, "error": result.Get("message").String(), "latency_ms": latencyMs})
+		log.Printf("[admin] test proxy upstream failed url=%q message=%q", req.URL, truncate(result.Get("message").String(), 200))
+		c.JSON(http.StatusOK, gin.H{"success": false, "error": "查询出口信息失败", "latency_ms": latencyMs})
 		return
 	}
 

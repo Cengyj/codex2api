@@ -164,7 +164,6 @@ step_secrets() {
   fi
 
   echo ""
-  ask "下游 API 密钥 (CODEX_API_KEYS, 多个用逗号分隔, 留空不启用)" "" API_KEYS
 }
 
 # ---------- 第四步：构建方式 ----------
@@ -209,11 +208,6 @@ step_confirm() {
   fi
   echo "  构建方式:   $( [[ "$BUILD_MODE" == "image" ]] && echo "拉取镜像" || echo "本地构建" )"
   echo "  管理密钥:   ${ADMIN_SECRET:0:6}******"
-  if [[ -n "${API_KEYS:-}" ]]; then
-    echo "  API 密钥:   已设置"
-  else
-    echo "  API 密钥:   未启用"
-  fi
   echo ""
   ask "确认部署? (y/n)" "y" CONFIRM
   if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
@@ -292,11 +286,6 @@ EOF
   fi
 
   # 追加 API Keys
-  if [[ -n "${API_KEYS:-}" ]]; then
-    echo "" >> .env
-    echo "# 下游 API 密钥鉴权" >> .env
-    echo "CODEX_API_KEYS=${API_KEYS}" >> .env
-  fi
 
   success ".env 已生成"
 }

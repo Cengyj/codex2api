@@ -1,6 +1,6 @@
 import type { ChangeEvent, DragEvent } from 'react'
-import { useCallback, useEffect, useRef, useState, useMemo } from 'react'
-import { api, getAdminKey } from '../api'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { adminFetch, api, readAdminErrorResponse } from '../api'
 import Modal from '../components/Modal'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
@@ -10,12 +10,13 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { AccountRow, AddAccountRequest, AddATAccountRequest } from '../types'
+import type { AccountRow, AddAccountRequest, AddATAccountRequest, ProxyMode, ProxyProtocol } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import {
   Table,
   TableBody,
@@ -24,9 +25,12 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, Search, Fingerprint, FolderOpen, Lock, Unlock } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import AccountUsageModal from '../components/AccountUsageModal'
+
+type AccountsPageData = {
+  accounts: AccountRow[]
+}
 
 export default function Accounts() {
   const { t } = useTranslation()
@@ -35,13 +39,21 @@ export default function Accounts() {
   const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'team' | 'free'>('all')
-  const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
+  const [sortKey, setSortKey] = useState<'importTime' | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
 
   const PAGE_SIZE = 20
+  const [proxyDefaults, setProxyDefaults] = useState({
+    mode: 'static' as ProxyMode,
+    providerUrl: '',
+    protocol: 'http' as ProxyProtocol,
+  })
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: '',
     proxy_url: '',
+    proxy_mode: proxyDefaults.mode,
+    proxy_provider_url: proxyDefaults.providerUrl,
+    proxy_protocol: proxyDefaults.protocol,
   })
   const [submitting, setSubmitting] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -52,7 +64,6 @@ export default function Accounts() {
   const [cleaningRateLimited, setCleaningRateLimited] = useState(false)
   const [cleaningError, setCleaningError] = useState(false)
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null)
-  const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null)
   const [importing, setImporting] = useState(false)
   const [showImportPicker, setShowImportPicker] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -64,10 +75,14 @@ export default function Accounts() {
   const [migrateKey, setMigrateKey] = useState('')
   const [migrating, setMigrating] = useState(false)
   const [importProgress, setImportProgress] = useState<{ show: boolean; current: number; total: number; success: number; duplicate: number; failed: number; done: boolean }>({ show: false, current: 0, total: 0, success: 0, duplicate: 0, failed: 0, done: false })
+  const [batchRefreshProgress, setBatchRefreshProgress] = useState<{ active: boolean; total: number; processed: number; success: number; failed: number }>({ active: false, total: 0, processed: 0, success: 0, failed: 0 })
   const [addMethod, setAddMethod] = useState<'rt' | 'at' | 'oauth'>('rt')
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: '',
     proxy_url: '',
+    proxy_mode: proxyDefaults.mode,
+    proxy_provider_url: proxyDefaults.providerUrl,
+    proxy_protocol: proxyDefaults.protocol,
   })
   const [oauthStep, setOauthStep] = useState<'generate' | 'exchange'>('generate')
   const [oauthSession, setOauthSession] = useState<{ session_id: string; auth_url: string } | null>(null)
@@ -85,40 +100,58 @@ export default function Accounts() {
 
   const loadAccounts = useCallback(async () => {
     const data = await api.getAccounts()
-    return data.accounts ?? []
+    return {
+      accounts: data.accounts ?? [],
+    }
   }, [])
 
-  const { data: accounts, loading, error, reload, reloadSilently } = useDataLoader<AccountRow[]>({
-    initialData: [],
+  const { data, loading, error, reload, reloadSilently } = useDataLoader<AccountsPageData>({
+    initialData: { accounts: [] },
     load: loadAccounts,
   })
-  const usageBootstrapReloadedRef = useRef(false)
+  const accounts = data.accounts
 
   useEffect(() => {
-    const hasMissingUsage = accounts.some(
-      (account) => account.plan_type?.toLowerCase() === 'free' && (account.usage_percent_7d === null || account.usage_percent_7d === undefined)
-    )
-    if (!hasMissingUsage || usageBootstrapReloadedRef.current) {
-      return
-    }
-
-    usageBootstrapReloadedRef.current = true
-    const timer = window.setTimeout(() => {
+    const timer = window.setInterval(() => {
       void reloadSilently()
-    }, 4000)
+    }, 15000)
 
-    return () => window.clearTimeout(timer)
-  }, [accounts, reloadSilently])
+    return () => window.clearInterval(timer)
+  }, [reloadSilently])
+
+  useEffect(() => {
+    let active = true
+    void api.getSettings()
+      .then((settings) => {
+        if (!active) return
+        const mode = settings.proxy_default_mode ?? 'static'
+        const protocol = settings.proxy_default_protocol ?? 'http'
+        const providerUrl = settings.proxy_dynamic_provider_url ?? ''
+        setProxyDefaults({ mode, providerUrl, protocol })
+        setAddForm((prev) => ({
+          ...prev,
+          proxy_mode: mode,
+          proxy_protocol: protocol,
+          proxy_provider_url: providerUrl,
+        }))
+        setAtForm((prev) => ({
+          ...prev,
+          proxy_mode: mode,
+          proxy_protocol: protocol,
+          proxy_provider_url: providerUrl,
+        }))
+      })
+      .catch(() => {
+        /* ignore */
+      })
+    return () => { active = false }
+  }, [])
 
   const totalAccounts = accounts.length
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
   const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited' || account.status === 'usage_exhausted').length
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
   const lockedAccounts = accounts.filter((account) => account.locked).length
-  const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
-  const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
-  const riskyAccounts = accounts.filter((account) => account.health_tier === 'risky').length
-
   const filteredAccounts = accounts.filter((account) => {
     // 状态过滤
     switch (statusFilter) {
@@ -151,15 +184,8 @@ export default function Accounts() {
   })
 
   const sortedAccounts = [...filteredAccounts].sort((a, b) => {
-    if (!sortKey) return 0
-    let diff = 0
-    if (sortKey === 'requests') {
-      diff = ((a.success_requests ?? 0) + (a.error_requests ?? 0)) - ((b.success_requests ?? 0) + (b.error_requests ?? 0))
-    } else if (sortKey === 'usage') {
-      diff = (a.usage_percent_7d ?? -1) - (b.usage_percent_7d ?? -1)
-    } else if (sortKey === 'importTime') {
-      diff = new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime()
-    }
+    if (sortKey !== 'importTime') return 0
+    const diff = new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime()
     return sortDir === 'asc' ? diff : -diff
   })
 
@@ -199,7 +225,13 @@ export default function Accounts() {
       await api.addAccount(addForm)
       showToast(t('accounts.addSuccess'))
       setShowAdd(false)
-      setAddForm({ refresh_token: '', proxy_url: '' })
+      setAddForm({
+        refresh_token: '',
+        proxy_url: '',
+        proxy_mode: proxyDefaults.mode,
+        proxy_provider_url: proxyDefaults.providerUrl,
+        proxy_protocol: proxyDefaults.protocol,
+      })
       void reload()
     } catch (error) {
       showToast(t('accounts.addFailed', { error: getErrorMessage(error) }), 'error')
@@ -215,7 +247,13 @@ export default function Accounts() {
       await api.addATAccount(atForm)
       showToast(t('accounts.addSuccess'))
       setShowAdd(false)
-      setAtForm({ access_token: '', proxy_url: '' })
+      setAtForm({
+        access_token: '',
+        proxy_url: '',
+        proxy_mode: proxyDefaults.mode,
+        proxy_provider_url: proxyDefaults.providerUrl,
+        proxy_protocol: proxyDefaults.protocol,
+      })
       void reload()
     } catch (error) {
       showToast(t('accounts.addFailed', { error: getErrorMessage(error) }), 'error')
@@ -308,15 +346,19 @@ export default function Accounts() {
     try {
       const formData = new FormData()
       if (format !== 'txt') formData.append('format', format)
+      if (proxyDefaults.mode) formData.append('proxy_mode', proxyDefaults.mode)
+      if (proxyDefaults.providerUrl) formData.append('proxy_provider_url', proxyDefaults.providerUrl)
+      if (proxyDefaults.protocol) formData.append('proxy_protocol', proxyDefaults.protocol)
       for (const f of files) formData.append('file', f)
-      const res = await fetch('/api/admin/accounts/import', { method: 'POST', body: formData, headers: getAdminKey() ? { 'X-Admin-Key': getAdminKey() } : {} })
+      const res = await adminFetch('/accounts/import', { method: 'POST', body: formData })
       if (res.headers.get('content-type')?.includes('text/event-stream')) {
         await readImportSSE(res)
       } else {
-        const data = await res.json()
         if (!res.ok) {
-          showToast(data.error ? t('accounts.importFailedWithReason', { error: data.error }) : t('accounts.importFailed'), 'error')
+          const errorMessage = await readAdminErrorResponse(res)
+          showToast(errorMessage ? t('accounts.importFailedWithReason', { error: errorMessage }) : t('accounts.importFailed'), 'error')
         } else {
+          await res.json()
           showToast(t('accounts.importCompleted'))
           void reload()
         }
@@ -537,18 +579,19 @@ export default function Accounts() {
     setMigrating(true)
     setShowMigrate(false)
     try {
-      const res = await fetch('/api/admin/accounts/migrate', {
+      const res = await adminFetch('/accounts/migrate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(getAdminKey() ? { 'X-Admin-Key': getAdminKey() } : {}) },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: migrateUrl.trim(), admin_key: migrateKey.trim() }),
       })
       if (res.headers.get('content-type')?.includes('text/event-stream')) {
         await readImportSSE(res)
       } else {
-        const data = await res.json()
         if (!res.ok) {
-          showToast(data.error ? `${t('accounts.migrateFailed')}: ${data.error}` : t('accounts.migrateFailed'), 'error')
+          const errorMessage = await readAdminErrorResponse(res)
+          showToast(errorMessage ? `${t('accounts.migrateFailed')}: ${errorMessage}` : t('accounts.migrateFailed'), 'error')
         } else {
+          const data = await res.json()
           showToast(t('accounts.migrateSuccess', { imported: data.imported ?? 0, duplicate: data.duplicate ?? 0, failed: data.failed ?? 0 }))
           void reload()
         }
@@ -638,18 +681,36 @@ export default function Accounts() {
   const handleBatchRefresh = async () => {
     if (selected.size === 0) return
     setBatchLoading(true)
+    setBatchRefreshProgress({
+      active: true,
+      total: selected.size,
+      processed: 0,
+      success: 0,
+      failed: 0,
+    })
     let success = 0
     let fail = 0
     for (const id of selected) {
       try {
         await api.refreshAccount(id)
         success++
+        setBatchRefreshProgress((prev) => ({
+          ...prev,
+          processed: prev.processed + 1,
+          success: prev.success + 1,
+        }))
       } catch {
         fail++
+        setBatchRefreshProgress((prev) => ({
+          ...prev,
+          processed: prev.processed + 1,
+          failed: prev.failed + 1,
+        }))
       }
     }
     showToast(t('accounts.batchRefreshDone', { success, fail }))
     setBatchLoading(false)
+    setBatchRefreshProgress((prev) => ({ ...prev, active: false }))
     void reload()
   }
 
@@ -872,14 +933,6 @@ export default function Accounts() {
           ))}
         </div>
 
-        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-white/55 px-4 py-3 text-[12px] text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]">
-          <span className="font-semibold text-foreground">{t('accounts.schedulerView')}</span>
-          <SchedulerChip label={t('accounts.healthy')} value={healthyAccounts} tone="success" />
-          <SchedulerChip label={t('accounts.warm')} value={warmAccounts} tone="warning" />
-          <SchedulerChip label={t('accounts.risky')} value={riskyAccounts} tone="danger" />
-          <SchedulerChip label={t('status.unauthorized')} value={bannedAccounts} tone="neutral" />
-        </div>
-
         <div className="mb-4 flex items-center gap-2">
           <div className="relative w-64">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
@@ -954,22 +1007,19 @@ export default function Accounts() {
                       <TableHead className="text-[13px] font-semibold">ID</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.email')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.plan')}</TableHead>
+                      <TableHead className="text-[13px] font-semibold">{t('accounts.proxyColumn')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.status')}</TableHead>
                       <TableHead
                         className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
-                        onClick={() => { if (sortKey === 'requests') { setSortDir(d => d === 'asc' ? 'desc' : 'asc') } else { setSortKey('requests'); setSortDir('desc') }; setPage(1) }}
-                      >
-                        {t('accounts.requests')} {sortKey === 'requests' ? (sortDir === 'desc' ? '↓' : '↑') : ''}
-                      </TableHead>
-                      <TableHead
-                        className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
-                        onClick={() => { if (sortKey === 'usage') { setSortDir(d => d === 'asc' ? 'desc' : 'asc') } else { setSortKey('usage'); setSortDir('desc') }; setPage(1) }}
-                      >
-                        {t('accounts.usage')} {sortKey === 'usage' ? (sortDir === 'desc' ? '↓' : '↑') : ''}
-                      </TableHead>
-                      <TableHead
-                        className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
-                        onClick={() => { if (sortKey === 'importTime') { setSortDir(d => d === 'asc' ? 'desc' : 'asc') } else { setSortKey('importTime'); setSortDir('desc') }; setPage(1) }}
+                        onClick={() => {
+                          if (sortKey === 'importTime') {
+                            setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
+                          } else {
+                            setSortKey('importTime')
+                            setSortDir('desc')
+                          }
+                          setPage(1)
+                        }}
                       >
                         {t('accounts.importTime')} {sortKey === 'importTime' ? (sortDir === 'desc' ? '↓' : '↑') : ''}
                       </TableHead>
@@ -1007,6 +1057,9 @@ export default function Accounts() {
                         >
                           {account.plan_type || '-'}
                         </TableCell>
+                        <TableCell className="text-[13px]">
+                          <ProxyInfo account={account} />
+                        </TableCell>
                         <TableCell>
                           <div className="space-y-1">
                             <StatusBadge status={account.status} />
@@ -1022,29 +1075,10 @@ export default function Accounts() {
                             </div>
                           </div>
                         </TableCell>
-                        <TableCell>
-                          <div className="flex items-center gap-2 text-[13px]">
-                            <span className="text-emerald-600 font-medium">{account.success_requests ?? 0}</span>
-                            <span className="text-muted-foreground">/</span>
-                            <span className="text-red-500 font-medium">{account.error_requests ?? 0}</span>
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          <UsageCell account={account} />
-                        </TableCell>
                         <TableCell className="text-[13px] text-muted-foreground whitespace-nowrap">{formatBeijingTime(account.created_at)}</TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">{formatRelativeTime(account.updated_at)}</TableCell>
                         <TableCell className="text-right">
                           <div className="flex items-center gap-1 justify-end">
-                            <Button
-                              variant="outline"
-                              size="icon"
-                              className="h-7 w-8 px-0"
-                              onClick={() => setUsageAccount(account)}
-                              title={t('accounts.usageDetail')}
-                            >
-                              <BarChart3 className="size-3.5" />
-                            </Button>
                             <Button
                               variant="outline"
                               size="icon"
@@ -1201,16 +1235,11 @@ export default function Accounts() {
                   rows={6}
                 />
               </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.proxyUrl')}</label>
-                <Input
-                  placeholder={t('accounts.proxyUrlPlaceholder')}
-                  value={addForm.proxy_url}
-                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                    setAddForm((form) => ({ ...form, proxy_url: event.target.value }))
-                  }
-                />
-              </div>
+              <ProxyConfigSection
+                form={addForm}
+                defaults={proxyDefaults}
+                onChange={(changes: Partial<AddAccountRequest>) => setAddForm((form) => ({ ...form, ...changes }))}
+              />
             </div>
           ) : addMethod === 'at' ? (
             <div className="space-y-4">
@@ -1229,16 +1258,11 @@ export default function Accounts() {
                   rows={6}
                 />
               </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.proxyUrl')}</label>
-                <Input
-                  placeholder={t('accounts.proxyUrlPlaceholder')}
-                  value={atForm.proxy_url}
-                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                    setAtForm((form) => ({ ...form, proxy_url: event.target.value }))
-                  }
-                />
-              </div>
+              <ProxyConfigSection
+                form={atForm}
+                defaults={proxyDefaults}
+                onChange={(changes: Partial<AddATAccountRequest>) => setAtForm((form) => ({ ...form, ...changes }))}
+              />
             </div>
           ) : (
             <div className="space-y-5">
@@ -1483,10 +1507,6 @@ export default function Accounts() {
           />
         )}
 
-        {usageAccount && (
-          <AccountUsageModal account={usageAccount} onClose={() => setUsageAccount(null)} />
-        )}
-
         <Modal
           show={importProgress.show}
           title={importProgress.done ? t('accounts.importDone') : t('accounts.importingProgress')}
@@ -1589,30 +1609,6 @@ function CompactStat({
   )
 }
 
-function SchedulerChip({
-  label,
-  value,
-  tone,
-}: {
-  label: string
-  value: number
-  tone: 'neutral' | 'success' | 'warning' | 'danger'
-}) {
-  const toneStyle = {
-    neutral: 'bg-slate-500/10 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300',
-    success: 'bg-emerald-500/10 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300',
-    warning: 'bg-amber-500/10 text-amber-600 dark:bg-amber-500/20 dark:text-amber-300',
-    danger: 'bg-red-500/10 text-red-600 dark:bg-red-500/20 dark:text-red-300',
-  }[tone]
-
-  return (
-    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 font-semibold ${toneStyle}`}>
-      <span>{label}</span>
-      <span>{value}</span>
-    </span>
-  )
-}
-
 function formatHealthTier(healthTier?: string, t?: any) {
   if (!t) return 'Unknown'
   switch (healthTier) {
@@ -1628,8 +1624,6 @@ function formatHealthTier(healthTier?: string, t?: any) {
       return t('accounts.unknown')
   }
 }
-
-// ==================== 测试连接弹窗 ====================
 
 interface TestEvent {
   type: 'test_start' | 'content' | 'test_complete' | 'error'
@@ -1708,18 +1702,12 @@ function TestConnectionModal({
       if (controller.signal.aborted) return
 
       try {
-        const res = await fetch(`/api/admin/accounts/${account.id}/test`, {
+        const res = await adminFetch(`/accounts/${account.id}/test`, {
           signal: controller.signal,
-          headers: getAdminKey() ? { 'X-Admin-Key': getAdminKey() } : {},
         })
 
         if (!res.ok) {
-          const body = await res.text()
-          let msg = `HTTP ${res.status}`
-          try {
-            const parsed = JSON.parse(body)
-            if (parsed.error) msg = parsed.error
-          } catch { /* ignore */ }
+          const msg = await readAdminErrorResponse(res)
           setStatus('error')
           setErrorMsg(msg)
           markSettled()
@@ -1894,72 +1882,134 @@ function TestConnectionModal({
   )
 }
 
-// 格式化重置时间为具体时间
-function formatResetAt(resetAt: string | undefined): string | null {
-  if (!resetAt) return null
-  const d = new Date(resetAt)
-  if (d.getTime() <= Date.now()) return null
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+type ProxyFormState = {
+  proxy_url?: string
+  proxy_provider_url?: string
+  proxy_mode?: ProxyMode
+  proxy_protocol?: ProxyProtocol
 }
 
-// 用量进度条颜色
-function usageBarColor(pct: number): string {
-  if (pct >= 90) return 'bg-red-500'
-  if (pct >= 70) return 'bg-amber-500'
-  return 'bg-emerald-500'
+type ProxyDefaultsState = {
+  mode: ProxyMode
+  providerUrl: string
+  protocol: ProxyProtocol
 }
 
-// 单行用量进度条
-function UsageBar({ label, pct, resetAt }: { label: string; pct: number; resetAt?: string }) {
-  const resetText = formatResetAt(resetAt)
+function ProxyConfigSection<T extends ProxyFormState>({
+  form,
+  defaults,
+  onChange,
+}: {
+  form: T
+  defaults: ProxyDefaultsState
+  onChange: (changes: Partial<T>) => void
+}) {
+  const { t } = useTranslation()
+  const mode = (form.proxy_mode ?? defaults.mode) as ProxyMode
+  const protocol = (form.proxy_protocol ?? defaults.protocol) as ProxyProtocol
+
+  const modeOptions = [
+    { value: 'static', label: t('accounts.proxyModeStatic') },
+    { value: 'dynamic', label: t('accounts.proxyModeDynamic') },
+    { value: 'auto', label: t('accounts.proxyModeAuto') },
+    { value: 'none', label: t('accounts.proxyModeNone') },
+  ]
+  const protocolOptions = [
+    { value: 'http', label: t('accounts.proxyProtocolHttp') },
+    { value: 'https', label: t('accounts.proxyProtocolHttps') },
+    { value: 'socks5', label: t('accounts.proxyProtocolSocks5') },
+    { value: 'socks4', label: t('accounts.proxyProtocolSocks4') },
+    { value: 'auto', label: t('accounts.proxyProtocolAuto') },
+  ]
+
   return (
-    <div>
-      <div className="flex items-center gap-1.5">
-        <span className="text-[11px] font-medium text-muted-foreground w-5 shrink-0">{label}</span>
-        <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden min-w-[72px]">
-          <div className={`h-full rounded-full transition-all ${usageBarColor(pct)}`} style={{ width: `${Math.min(100, pct)}%` }} />
+    <div className="space-y-4">
+      <div className="grid gap-3 md:grid-cols-2">
+        <div>
+          <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.proxyModeLabel')}</label>
+          <Select
+            value={mode}
+            onValueChange={(value) => onChange({ proxy_mode: value as ProxyMode } as Partial<T>)}
+            options={modeOptions}
+          />
+          <p className="text-xs text-muted-foreground mt-1">{t('accounts.proxyModeDesc')}</p>
         </div>
-        <span className="text-[12px] font-semibold w-[42px] text-right shrink-0">{pct.toFixed(1)}%</span>
+        <div>
+          <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.proxyProtocolLabel')}</label>
+          <Select
+            value={protocol}
+            onValueChange={(value) => onChange({ proxy_protocol: value as ProxyProtocol } as Partial<T>)}
+            options={protocolOptions}
+          />
+          <p className="text-xs text-muted-foreground mt-1">{t('accounts.proxyProtocolDesc')}</p>
+        </div>
       </div>
-      {resetText && <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">⏱ {resetText}</div>}
+      <div>
+        <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.proxyUrl')}</label>
+        <Input
+          placeholder={t('accounts.proxyUrlPlaceholder')}
+          value={form.proxy_url ?? ''}
+          onChange={(event: ChangeEvent<HTMLInputElement>) => onChange({ proxy_url: event.target.value } as Partial<T>)}
+        />
+      </div>
+      <div>
+        <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.proxyProviderUrlLabel')}</label>
+        <Input
+          placeholder={t('accounts.proxyProviderUrlPlaceholder')}
+          value={form.proxy_provider_url ?? ''}
+          onChange={(event: ChangeEvent<HTMLInputElement>) => onChange({ proxy_provider_url: event.target.value } as Partial<T>)}
+        />
+        <p className="text-xs text-muted-foreground mt-1">{t('accounts.proxyProviderUrlDesc')}</p>
+      </div>
     </div>
   )
 }
 
-// 用量列组件
-function UsageCell({ account }: { account: AccountRow }) {
-  const plan = (account.plan_type || '').toLowerCase()
-  const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
-  const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
-
-  if (plan === 'free') {
-    if (!has7d) return <span className="text-[12px] text-muted-foreground">-</span>
-    return (
-      <div className="w-40">
-        <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />
-      </div>
-    )
+function ProxyInfo({ account }: { account: AccountRow }) {
+  const { t } = useTranslation()
+  const mode = (account.proxy_mode ?? 'static') as ProxyMode
+  const protocol = (account.proxy_protocol ?? 'http') as ProxyProtocol
+  const modeLabels: Record<ProxyMode, string> = {
+    static: t('accounts.proxyModeStatic'),
+    dynamic: t('accounts.proxyModeDynamic'),
+    auto: t('accounts.proxyModeAuto'),
+    none: t('accounts.proxyModeNone'),
   }
-
-  if (plan === 'pro' || plan === 'team' || plan === 'plus' || plan === 'teamplus') {
-    if (!has5h && !has7d) return <span className="text-[12px] text-muted-foreground">-</span>
-    return (
-      <div className="w-48 space-y-1.5">
-        {has5h && <UsageBar label="5h" pct={account.usage_percent_5h!} resetAt={account.reset_5h_at} />}
-        {has7d && <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />}
-      </div>
-    )
+  const badgeStyles: Record<ProxyMode, string> = {
+    static: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200',
+    dynamic: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-200',
+    auto: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-200',
+    none: 'bg-muted/20 text-muted-foreground',
   }
+  const detailUrl =
+    mode === 'dynamic' || mode === 'auto'
+      ? account.proxy_provider_url || account.proxy_url || '-'
+      : account.proxy_url || '-'
+  const assignmentTime = account.proxy_assigned_at ?? account.proxy_last_switched_at
+  const assignedProxy = account.proxy_assigned_url || (mode === 'static' ? account.proxy_url : undefined)
 
-  if (has7d) {
-    return (
-      <div className="w-40">
-        <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />
+  return (
+    <div className="space-y-0.5 max-w-[220px]">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`text-[10px] font-semibold uppercase tracking-tight rounded-full px-2 py-0.5 ${badgeStyles[mode]}`}>
+          {modeLabels[mode]}
+        </span>
+        <span className="text-[10px] text-muted-foreground">{protocol.toUpperCase()}</span>
       </div>
-    )
-  }
-  return <span className="text-[13px] text-muted-foreground">-</span>
+      <div className="text-[12px] font-mono text-foreground break-all">{detailUrl}</div>
+      {assignedProxy && (
+        <div className="text-[11px] text-muted-foreground">
+          {t('accounts.assignedProxy', { proxy: assignedProxy })}
+          {assignmentTime && (
+            <>
+              <span className="mx-1">·</span>
+              {t('accounts.proxyUpdated', { time: formatRelativeTime(assignmentTime) })}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
 }
 
 // 冷却倒计时组件

@@ -3,7 +3,6 @@ package proxy
 import (
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -63,8 +62,12 @@ func mapHTTPStatusToAnthropicError(statusCode int) string {
 // Messages 处理 /v1/messages 请求（Anthropic Messages API → Codex Responses）
 func (h *Handler) Messages(c *gin.Context) {
 	// 1. 读取请求体
-	rawBody, err := io.ReadAll(c.Request.Body)
+	rawBody, err := readLimitedBytes(c.Request.Body, maxInboundBodyBytes)
 	if err != nil {
+		if errors.Is(err, errLimitedBodyTooLarge) {
+			sendAnthropicError(c, http.StatusRequestEntityTooLarge, "invalid_request_error", "Request body too large")
+			return
+		}
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
 	}
@@ -133,7 +136,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := h.store.NextProxy()
+		proxyURL := h.store.ResolveRuntimeProxy(c.Request.Context(), account)
 		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -158,13 +161,17 @@ func (h *Handler) Messages(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			transportKind := classifyTransportFailure(reqErr)
+			if transportKind != "" {
+				h.store.ReportRequestFailure(account, transportKind, time.Duration(durationMs)*time.Millisecond)
+				h.store.InvalidateProxyAssignment(c.Request.Context(), account, "network_error", reqErr.Error())
 			}
 			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
+			if transportKind == "" || !h.store.GetSwitchProxyOnNetworkError() {
+				excludeAccounts[account.ID()] = true
+			}
 
-			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+			if !IsRetryableError(reqErr) && transportKind == "" {
 				sendAnthropicError(c, http.StatusBadGateway, "api_error", "Upstream request failed")
 				return
 			}
@@ -181,12 +188,12 @@ func (h *Handler) Messages(c *gin.Context) {
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
 			}
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody := readUpstreamErrorBody(resp)
 			resp.Body.Close()
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 
-			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, string(errBody))
+			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, sanitizeUpstreamErrorForLog(errBody))
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
@@ -348,7 +355,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重试 (attempt %d/%d, account %d, /v1/messages): %s",
 				attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
 			}
@@ -407,7 +414,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			h.store.PersistUsageSnapshot(account, usagePct)
 		}
 		if outcome.penalize {
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
@@ -424,4 +431,3 @@ func (h *Handler) Messages(c *gin.Context) {
 		sendAnthropicError(c, lastStatusCode, errType, fmt.Sprintf("Upstream returned status %d", lastStatusCode))
 	}
 }
-

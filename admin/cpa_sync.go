@@ -20,6 +20,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
 
@@ -28,16 +29,42 @@ const (
 	minCPASyncInterval        = 30 * time.Second
 	maxCPASyncInterval        = 24 * time.Hour
 	cpaSyncRequestTimeout     = 45 * time.Second
+	cpaSyncStatusReadTimeout  = 15 * time.Second
+	cpaSyncMaxResponseBody    = 2 * 1024 * 1024
 	cpaSyncMaxRecentEvents    = 30
 	defaultMihomoDelayTestURL = "https://cp.cloudflare.com/generate_204"
+	cpaSwitchReasonThreshold  = "banned_delete_threshold"
+
+	cpaErrorKindUsageLimitReached  = "usage_limit_reached"
+	cpaErrorKindAccountDeactivated = "account_deactivated"
+	cpaErrorKindTokenInvalidated   = "token_invalidated"
 )
 
 var errCPASyncBusy = errors.New("CPA sync is already running")
+
+type requestValidationError struct {
+	message string
+}
+
+func (e *requestValidationError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
+}
+
+func newRequestValidationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &requestValidationError{message: err.Error()}
+}
 
 type CPASyncService struct {
 	store       *auth.Store
 	db          *database.DB
 	client      *http.Client
+	uploadProbe func(context.Context, *auth.Account) uploadCandidateProbeResult
 	stopCh      chan struct{}
 	configCh    chan struct{}
 	wg          sync.WaitGroup
@@ -106,6 +133,40 @@ type cpaDownloadedAccount struct {
 	PlanType     string
 }
 
+type cpaUploadCandidate struct {
+	DBID  int64
+	Entry cpaExportEntry
+}
+
+type uploadCandidateProbeState string
+
+const (
+	uploadCandidateProbeActive       uploadCandidateProbeState = "active"
+	uploadCandidateProbeUnauthorized uploadCandidateProbeState = "unauthorized"
+	uploadCandidateProbeRateLimited  uploadCandidateProbeState = "rate_limited"
+	uploadCandidateProbeUnknown      uploadCandidateProbeState = "unknown"
+)
+
+type uploadCandidateProbeResult struct {
+	State   uploadCandidateProbeState
+	Message string
+}
+
+type cpaRunMetrics struct {
+	ProcessedErrors   int
+	UploadedCount     int
+	FirstErrorSummary string
+	DeletedRemote     bool
+	UploadedRemote    bool
+}
+
+type cpaLocalAccountCache struct {
+	ctx    context.Context
+	db     *database.DB
+	rows   []*database.AccountRow
+	loaded bool
+}
+
 type mihomoSelectorDetail struct {
 	Now string   `json:"now"`
 	All []string `json:"all"`
@@ -139,13 +200,15 @@ type cpaSyncConnectionTestRequest struct {
 }
 
 func NewCPASyncService(store *auth.Store, db *database.DB) *CPASyncService {
-	return &CPASyncService{
+	service := &CPASyncService{
 		store:    store,
 		db:       db,
 		client:   &http.Client{Timeout: cpaSyncRequestTimeout},
 		stopCh:   make(chan struct{}),
 		configCh: make(chan struct{}, 1),
 	}
+	service.uploadProbe = service.probeUploadCandidate
+	return service
 }
 
 func (s *CPASyncService) Start() {
@@ -245,7 +308,16 @@ func (s *CPASyncService) nextRunAt() string {
 
 func (s *CPASyncService) statusAfterRun(ctx context.Context) (*cpaSyncStatusResponse, error) {
 	s.running.Store(false)
-	return s.Status(ctx)
+	statusCtx, cancel := context.WithTimeout(context.Background(), cpaSyncStatusReadTimeout)
+	defer cancel()
+	return s.Status(statusCtx)
+}
+
+func (s *CPASyncService) persistState(ctx context.Context, state *database.CPASyncState) error {
+	if err := s.db.UpdateCPASyncState(ctx, state); err != nil {
+		return fmt.Errorf("persist CPA sync state: %w", err)
+	}
+	return nil
 }
 
 func (s *CPASyncService) Status(ctx context.Context) (*cpaSyncStatusResponse, error) {
@@ -258,12 +330,13 @@ func (s *CPASyncService) Status(ctx context.Context) (*cpaSyncStatusResponse, er
 		return nil, err
 	}
 	s.normalizeState(state, settings, time.Now().UTC())
+	sanitizedState := sanitizeCPASyncStateForAPI(state)
 
 	return &cpaSyncStatusResponse{
 		Config:           settings.summary(),
-		State:            state,
-		CPATestStatus:    normalizeConnectionTestStatus(state.CPATestStatus),
-		MihomoTestStatus: normalizeConnectionTestStatus(state.MihomoTestStatus),
+		State:            sanitizedState,
+		CPATestStatus:    sanitizedState.CPATestStatus,
+		MihomoTestStatus: sanitizedState.MihomoTestStatus,
 		Running:          s.running.Load(),
 		NextRunAt:        s.nextRunAt(),
 	}, nil
@@ -292,7 +365,10 @@ func (s *CPASyncService) ForceSwitch(ctx context.Context) (*cpaSyncStatusRespons
 	s.normalizeState(state, settings, now)
 	if missing := settings.missingMihomoConfig(); len(missing) > 0 {
 		s.recordStateFailure(state, "switch_error", fmt.Sprintf("missing config: %s", strings.Join(missing, ", ")))
-		_ = s.db.UpdateCPASyncState(ctx, state)
+		if err := s.persistState(ctx, state); err != nil {
+			s.running.Store(false)
+			return nil, err
+		}
 		return s.statusAfterRun(ctx)
 	}
 
@@ -309,7 +385,10 @@ func (s *CPASyncService) ForceSwitch(ctx context.Context) (*cpaSyncStatusRespons
 		state.LastRunSummary = fmt.Sprintf("switched selector to %s", state.CurrentMihomoNode)
 		state.LastErrorSummary = ""
 	}
-	_ = s.db.UpdateCPASyncState(ctx, state)
+	if err := s.persistState(ctx, state); err != nil {
+		s.running.Store(false)
+		return nil, err
+	}
 	return s.statusAfterRun(ctx)
 }
 
@@ -325,7 +404,7 @@ func (s *CPASyncService) TestCPA(ctx context.Context, req *cpaSyncConnectionTest
 		return nil, err
 	}
 	s.syncCPAStateFromTestStatus(state, normalized)
-	if err := s.db.UpdateCPASyncState(ctx, state); err != nil {
+	if err := s.persistState(ctx, state); err != nil {
 		return nil, err
 	}
 	return &normalized, nil
@@ -343,7 +422,7 @@ func (s *CPASyncService) TestMihomo(ctx context.Context, req *cpaSyncConnectionT
 		return nil, err
 	}
 	s.syncMihomoStateFromTestStatus(state, normalized)
-	if err := s.db.UpdateCPASyncState(ctx, state); err != nil {
+	if err := s.persistState(ctx, state); err != nil {
 		return nil, err
 	}
 	return &normalized, nil
@@ -380,185 +459,47 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 
 	if !allowWhenDisabled && !settings.Enabled {
 		s.recordSkip(state, "disabled")
-		_ = s.db.UpdateCPASyncState(ctx, state)
+		if err := s.persistState(ctx, state); err != nil {
+			s.running.Store(false)
+			return nil, err
+		}
 		return s.statusAfterRun(ctx)
 	}
 	if missing := settings.missingCPAConfig(); len(missing) > 0 {
 		s.recordStateFailure(state, "skipped", fmt.Sprintf("missing config: %s", strings.Join(missing, ", ")))
-		_ = s.db.UpdateCPASyncState(ctx, state)
+		if err := s.persistState(ctx, state); err != nil {
+			s.running.Store(false)
+			return nil, err
+		}
 		return s.statusAfterRun(ctx)
 	}
 
 	records, err := s.listCPAAuthFiles(ctx, settings)
 	if err != nil {
 		s.recordStateFailure(state, "error", fmt.Sprintf("list CPA auth files failed: %v", err))
-		_ = s.db.UpdateCPASyncState(ctx, state)
+		if persistErr := s.persistState(ctx, state); persistErr != nil {
+			s.running.Store(false)
+			return nil, persistErr
+		}
 		return s.statusAfterRun(ctx)
 	}
 
-	processedErrors := 0
-	uploadedCount := 0
-	firstErrorSummary := ""
+	metrics := &cpaRunMetrics{}
 	downloadedTokens := make(map[string]struct{})
-	deletedRemote := false
-	uploadedRemote := false
-	remainingRecords := append([]cpaAuthFileRecord{}, records...)
-	for _, record := range records {
-		kind := detectCPAErrorKind(record.StatusMessage)
-		if kind == "" {
-			continue
-		}
-		processedErrors++
-		remote, downloadErr := s.downloadCPAAuthFile(ctx, settings, record.Name)
-		if downloadErr != nil {
-			s.recordAction(state, "download", "error", fmt.Sprintf("download failed: %v", downloadErr), record.Name)
-			if firstErrorSummary == "" {
-				firstErrorSummary = fmt.Sprintf("download %s failed: %v", record.Name, downloadErr)
-			}
-		} else {
-			if remote.RefreshToken != "" {
-				downloadedTokens["rt:"+remote.RefreshToken] = struct{}{}
-			}
-			if remote.AccessToken != "" {
-				downloadedTokens["at:"+remote.AccessToken] = struct{}{}
-			}
-		}
-
-		localRows, listErr := s.db.ListAllAccounts(ctx)
-		if listErr != nil {
-			s.recordAction(state, "reconcile", "error", fmt.Sprintf("load local accounts failed: %v", listErr), record.Name)
-			if firstErrorSummary == "" {
-				firstErrorSummary = fmt.Sprintf("load local accounts failed: %v", listErr)
-			}
-		} else if downloadErr == nil {
-			if matched, matchKind := matchLocalAccount(localRows, remote); matched != nil {
-				delta := buildCredentialDelta(matched, remote)
-				if len(delta) > 0 {
-					if err := s.db.UpdateCredentials(ctx, matched.ID, delta); err != nil {
-						s.recordAction(state, "reconcile", "error", fmt.Sprintf("update local credentials failed: %v", err), record.Name)
-						if firstErrorSummary == "" {
-							firstErrorSummary = fmt.Sprintf("update local credentials failed: %v", err)
-						}
-					} else {
-						s.applyInMemoryCredentials(matched.ID, remote)
-						s.recordAction(state, "reconcile", "success", fmt.Sprintf("updated local credentials via %s", matchKind), record.Name)
-					}
-				}
-				if kind == "account_deactivated" || kind == "token_invalidated" {
-					s.markUnauthorized(matched.ID)
-				} else if kind == "usage_limit_reached" {
-					s.markRateLimited(matched.ID, record.StatusMessage)
-				}
-			} else if kind != "account_deactivated" && kind != "token_invalidated" && localAccountCandidateCount(localRows, remote) == 0 {
-				importedID, importName, err := s.importRemoteAccount(ctx, remote)
-				if err != nil {
-					s.recordAction(state, "reconcile", "error", fmt.Sprintf("create local account failed: %v", err), record.Name)
-					if firstErrorSummary == "" {
-						firstErrorSummary = fmt.Sprintf("create local account failed: %v", err)
-					}
-				} else {
-					s.recordAction(state, "reconcile", "success", fmt.Sprintf("created local account %s from CPA", importName), record.Name)
-					s.db.InsertAccountEventAsync(importedID, "added", "cpa_sync")
-					if kind == "usage_limit_reached" {
-						s.markRateLimited(importedID, record.StatusMessage)
-					}
-				}
-			} else {
-				s.recordAction(state, "reconcile", "warning", "no unique local account match found", record.Name)
-			}
-		}
-
-		if err := s.deleteCPAAuthFile(ctx, settings, record.Name); err != nil {
-			s.recordAction(state, "delete", "error", fmt.Sprintf("delete failed: %v", err), record.Name)
-			if firstErrorSummary == "" {
-				firstErrorSummary = fmt.Sprintf("delete %s failed: %v", record.Name, err)
-			}
-		} else {
-			deletedRemote = true
-			s.recordAction(state, "delete", "success", "deleted remote CPA account", record.Name)
-			remainingRecords = removeCPAAuthFileRecordByName(remainingRecords, record.Name)
-		}
-	}
-
-	records = remainingRecords
+	records = s.processCPAErrorRecords(ctx, settings, state, records, downloadedTokens, metrics)
 	effectiveRecords := filterEffectiveCPAAuthFileRecords(records)
 	state.LastCPAAccountCount = len(effectiveRecords)
 
-	targetCount := settings.MinAccounts
-	if settings.MaxAccounts > 0 && (targetCount == 0 || settings.MaxAccounts < targetCount) {
-		targetCount = settings.MaxAccounts
-	}
-	if targetCount < 0 {
-		targetCount = 0
-	}
-
-	if state.LastCPAAccountCount < targetCount {
-		remaining := targetCount - state.LastCPAAccountCount
-		if settings.MaxUploadsPerHour > 0 {
-			allowed := settings.MaxUploadsPerHour - state.HourlyUploadCount
-			if allowed < remaining {
-				remaining = allowed
-			}
-		}
-		if settings.MaxAccounts > 0 {
-			room := settings.MaxAccounts - state.LastCPAAccountCount
-			if room < remaining {
-				remaining = room
-			}
-		}
-		if remaining > 0 {
-			candidates, err := s.selectUploadCandidates(ctx, effectiveRecords, downloadedTokens, remaining)
-			if err != nil {
-				s.recordAction(state, "upload", "error", fmt.Sprintf("select candidates failed: %v", err), "")
-				if firstErrorSummary == "" {
-					firstErrorSummary = fmt.Sprintf("select upload candidates failed: %v", err)
-				}
-			} else {
-				for _, candidate := range candidates {
-					name := buildCPAAuthFileName(candidate)
-					if err := s.uploadCPAAuthFile(ctx, settings, name, candidate); err != nil {
-						s.recordAction(state, "upload", "error", fmt.Sprintf("upload failed: %v", err), name)
-						if firstErrorSummary == "" {
-							firstErrorSummary = fmt.Sprintf("upload %s failed: %v", name, err)
-						}
-						continue
-					}
-					uploadedRemote = true
-					uploadedCount++
-					state.HourlyUploadCount++
-					effectiveRecords = append(effectiveRecords, cpaAuthFileRecord{
-						Name:   name,
-						Email:  candidate.Email,
-						Status: "active",
-					})
-					s.recordAction(state, "upload", "success", fmt.Sprintf("uploaded %s", candidate.Email), name)
-				}
-			}
-		}
-	}
-	if deletedRemote || uploadedRemote {
-		refreshed, recountErr := s.listCPAAuthFiles(ctx, settings)
-		if recountErr != nil {
-			s.recordAction(state, "run", "warning", fmt.Sprintf("final CPA auth file recount failed: %v", recountErr), "")
-			if firstErrorSummary == "" {
-				firstErrorSummary = fmt.Sprintf("final CPA auth file recount failed: %v", recountErr)
-			} else {
-				firstErrorSummary = fmt.Sprintf("%s; final CPA auth file recount failed: %v", firstErrorSummary, recountErr)
-			}
-		} else {
-			records = refreshed
-			effectiveRecords = filterEffectiveCPAAuthFileRecords(records)
-		}
-	}
+	targetCount := resolveCPATargetCount(settings)
+	effectiveRecords = s.uploadMissingCPAAccounts(ctx, settings, state, effectiveRecords, downloadedTokens, targetCount, metrics)
+	records, effectiveRecords = s.refreshCPARecordsAfterRemoteChanges(ctx, settings, state, records, effectiveRecords, metrics)
 	state.LastCPAAccountCount = len(effectiveRecords)
 	s.syncCPAAccountCountSnapshot(state, state.LastCPAAccountCount, len(records), time.Now().UTC())
 
-	if eligible, reason := s.shouldAutoSwitchForHourlyLimit(state, settings, now); eligible {
-		if err := s.switchMihomo(ctx, settings, state, "hourly_upload_limit"); err != nil {
+	if eligible, reason := s.shouldAutoSwitchForBannedDeleteThreshold(state, settings); eligible {
+		if err := s.switchMihomo(ctx, settings, state, cpaSwitchReasonThreshold); err != nil {
 			s.recordAction(state, "switch", "error", fmt.Sprintf("switch failed: %v", err), settings.MihomoStrategyGroup)
-			if firstErrorSummary == "" {
-				firstErrorSummary = fmt.Sprintf("switch Mihomo failed: %v", err)
-			}
+			metrics.setFirstErrorf("switch Mihomo failed: %v", err)
 		} else {
 			s.recordAction(state, "switch", "success", fmt.Sprintf("switched selector to %s", state.CurrentMihomoNode), settings.MihomoStrategyGroup)
 		}
@@ -570,15 +511,18 @@ func (s *CPASyncService) runOnce(ctx context.Context, trigger string, allowWhenD
 	}
 
 	state.LastRunAt = now.Format(time.RFC3339)
-	if firstErrorSummary != "" {
+	if metrics.FirstErrorSummary != "" {
 		state.LastRunStatus = "partial_success"
-		state.LastErrorSummary = firstErrorSummary
+		state.LastErrorSummary = metrics.FirstErrorSummary
 	} else {
 		state.LastRunStatus = "success"
 		state.LastErrorSummary = ""
 	}
-	state.LastRunSummary = fmt.Sprintf("trigger=%s, cpa_count=%d, processed_errors=%d, uploaded=%d", trigger, state.LastCPAAccountCount, processedErrors, uploadedCount)
-	_ = s.db.UpdateCPASyncState(ctx, state)
+	state.LastRunSummary = fmt.Sprintf("trigger=%s, cpa_count=%d, processed_errors=%d, uploaded=%d", trigger, state.LastCPAAccountCount, metrics.ProcessedErrors, metrics.UploadedCount)
+	if err := s.persistState(ctx, state); err != nil {
+		s.running.Store(false)
+		return nil, err
+	}
 
 	return s.statusAfterRun(ctx)
 }
@@ -599,21 +543,95 @@ func (s *CPASyncService) loadSettings(ctx context.Context) (*cpaSyncSettings, er
 	if intervalSeconds <= 0 {
 		intervalSeconds = int(defaultCPASyncInterval / time.Second)
 	}
+
+	cpaBaseURL, err := validateExternalServiceBaseURL(ctx, raw.CPABaseURL, "cpa_base_url")
+	if err != nil {
+		log.Printf("[CPA Sync] 忽略无效 cpa_base_url: %v", err)
+		cpaBaseURL = ""
+	}
+	mihomoBaseURL, err := validateExternalServiceBaseURL(ctx, raw.MihomoBaseURL, "mihomo_base_url")
+	if err != nil {
+		log.Printf("[CPA Sync] 忽略无效 mihomo_base_url: %v", err)
+		mihomoBaseURL = ""
+	}
+	mihomoDelayTestURL, err := validateExternalTargetURL(ctx, raw.MihomoDelayTestURL, "mihomo_delay_test_url")
+	if err != nil {
+		log.Printf("[CPA Sync] 忽略无效 mihomo_delay_test_url: %v", err)
+		mihomoDelayTestURL = ""
+	}
+
 	return &cpaSyncSettings{
 		Enabled:             raw.CPASyncEnabled,
-		CPABaseURL:          strings.TrimRight(strings.TrimSpace(raw.CPABaseURL), "/"),
+		CPABaseURL:          cpaBaseURL,
 		CPAAdminKey:         strings.TrimSpace(raw.CPAAdminKey),
 		MinAccounts:         raw.CPAMinAccounts,
 		MaxAccounts:         raw.CPAMaxAccounts,
 		MaxUploadsPerHour:   raw.CPAMaxUploadsPerHour,
 		SwitchAfterUploads:  raw.CPASwitchAfterUploads,
 		Interval:            time.Duration(intervalSeconds) * time.Second,
-		MihomoBaseURL:       strings.TrimRight(strings.TrimSpace(raw.MihomoBaseURL), "/"),
+		MihomoBaseURL:       mihomoBaseURL,
 		MihomoSecret:        strings.TrimSpace(raw.MihomoSecret),
 		MihomoStrategyGroup: strings.TrimSpace(raw.MihomoStrategyGroup),
-		MihomoDelayTestURL:  strings.TrimSpace(raw.MihomoDelayTestURL),
+		MihomoDelayTestURL:  mihomoDelayTestURL,
 		MihomoDelayTimeout:  delayTimeout,
 	}, nil
+}
+
+func (m *cpaRunMetrics) setFirstErrorf(format string, args ...any) {
+	if m == nil || m.FirstErrorSummary != "" {
+		return
+	}
+	m.FirstErrorSummary = fmt.Sprintf(format, args...)
+}
+
+func (m *cpaRunMetrics) appendErrorf(format string, args ...any) {
+	if m == nil {
+		return
+	}
+	message := fmt.Sprintf(format, args...)
+	if m.FirstErrorSummary == "" {
+		m.FirstErrorSummary = message
+		return
+	}
+	m.FirstErrorSummary = fmt.Sprintf("%s; %s", m.FirstErrorSummary, message)
+}
+
+func (c *cpaLocalAccountCache) load() ([]*database.AccountRow, error) {
+	if c == nil {
+		return nil, errors.New("local account cache is nil")
+	}
+	if c.loaded {
+		return c.rows, nil
+	}
+	rows, err := c.db.ListAllAccounts(c.ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.rows = rows
+	c.loaded = true
+	return c.rows, nil
+}
+
+func (c *cpaLocalAccountCache) invalidate() {
+	if c == nil {
+		return
+	}
+	c.rows = nil
+	c.loaded = false
+}
+
+func resolveCPATargetCount(settings *cpaSyncSettings) int {
+	if settings == nil {
+		return 0
+	}
+	targetCount := settings.MinAccounts
+	if settings.MaxAccounts > 0 && (targetCount == 0 || settings.MaxAccounts < targetCount) {
+		targetCount = settings.MaxAccounts
+	}
+	if targetCount < 0 {
+		return 0
+	}
+	return targetCount
 }
 
 func (s *CPASyncService) loadSettingsWithOverrides(ctx context.Context, req *cpaSyncConnectionTestRequest) (*cpaSyncSettings, error) {
@@ -625,13 +643,21 @@ func (s *CPASyncService) loadSettingsWithOverrides(ctx context.Context, req *cpa
 		return settings, nil
 	}
 	if req.CPABaseURL != nil {
-		settings.CPABaseURL = strings.TrimRight(strings.TrimSpace(*req.CPABaseURL), "/")
+		sanitized, err := validateExternalServiceBaseURL(ctx, *req.CPABaseURL, "cpa_base_url")
+		if err != nil {
+			return nil, newRequestValidationError(err)
+		}
+		settings.CPABaseURL = sanitized
 	}
 	if req.CPAAdminKey != nil {
 		settings.CPAAdminKey = strings.TrimSpace(*req.CPAAdminKey)
 	}
 	if req.MihomoBaseURL != nil {
-		settings.MihomoBaseURL = strings.TrimRight(strings.TrimSpace(*req.MihomoBaseURL), "/")
+		sanitized, err := validateExternalServiceBaseURL(ctx, *req.MihomoBaseURL, "mihomo_base_url")
+		if err != nil {
+			return nil, newRequestValidationError(err)
+		}
+		settings.MihomoBaseURL = sanitized
 	}
 	if req.MihomoSecret != nil {
 		settings.MihomoSecret = strings.TrimSpace(*req.MihomoSecret)
@@ -640,7 +666,11 @@ func (s *CPASyncService) loadSettingsWithOverrides(ctx context.Context, req *cpa
 		settings.MihomoStrategyGroup = strings.TrimSpace(*req.MihomoStrategyGroup)
 	}
 	if req.MihomoDelayTestURL != nil {
-		settings.MihomoDelayTestURL = strings.TrimSpace(*req.MihomoDelayTestURL)
+		sanitized, err := validateExternalTargetURL(ctx, *req.MihomoDelayTestURL, "mihomo_delay_test_url")
+		if err != nil {
+			return nil, newRequestValidationError(err)
+		}
+		settings.MihomoDelayTestURL = sanitized
 	}
 	if req.MihomoDelayTimeout != nil {
 		settings.MihomoDelayTimeout = *req.MihomoDelayTimeout
@@ -660,6 +690,214 @@ func (c *cpaSyncSettings) missingCPAConfig() []string {
 		missing = append(missing, "cpa_admin_key")
 	}
 	return missing
+}
+
+func (s *CPASyncService) processCPAErrorRecords(
+	ctx context.Context,
+	settings *cpaSyncSettings,
+	state *database.CPASyncState,
+	records []cpaAuthFileRecord,
+	downloadedTokens map[string]struct{},
+	metrics *cpaRunMetrics,
+) []cpaAuthFileRecord {
+	cache := &cpaLocalAccountCache{ctx: ctx, db: s.db}
+	remainingRecords := append([]cpaAuthFileRecord{}, records...)
+	for _, record := range records {
+		kind := detectCPAErrorKind(record.StatusMessage)
+		if kind == "" {
+			continue
+		}
+		metrics.ProcessedErrors++
+
+		remote, downloadErr := s.downloadCPAAuthFile(ctx, settings, record.Name)
+		if downloadErr != nil {
+			s.recordAction(state, "download", "error", fmt.Sprintf("download failed: %v", downloadErr), record.Name)
+			metrics.setFirstErrorf("download %s failed: %v", record.Name, downloadErr)
+		} else {
+			addDownloadedAccountTokens(downloadedTokens, remote)
+			s.reconcileCPAErrorRecord(ctx, record, kind, remote, cache, state, metrics)
+		}
+
+		if err := s.deleteCPAAuthFile(ctx, settings, record.Name); err != nil {
+			s.recordAction(state, "delete", "error", fmt.Sprintf("delete failed: %v", err), record.Name)
+			metrics.setFirstErrorf("delete %s failed: %v", record.Name, err)
+			continue
+		}
+
+		metrics.DeletedRemote = true
+		if isCPABannedErrorKind(kind) {
+			// HourlyUploadCount is kept for API compatibility, but its effective
+			// meaning is now "banned deletes in the current switch window".
+			state.HourlyUploadCount++
+		}
+		s.recordAction(state, "delete", "success", "deleted remote CPA account", record.Name)
+		remainingRecords = removeCPAAuthFileRecordByName(remainingRecords, record.Name)
+	}
+	return remainingRecords
+}
+
+func (s *CPASyncService) reconcileCPAErrorRecord(
+	ctx context.Context,
+	record cpaAuthFileRecord,
+	kind string,
+	remote *cpaDownloadedAccount,
+	cache *cpaLocalAccountCache,
+	state *database.CPASyncState,
+	metrics *cpaRunMetrics,
+) {
+	if remote == nil {
+		return
+	}
+	localRows, err := cache.load()
+	if err != nil {
+		s.recordAction(state, "reconcile", "error", fmt.Sprintf("load local accounts failed: %v", err), record.Name)
+		metrics.setFirstErrorf("load local accounts failed: %v", err)
+		return
+	}
+
+	if matched, matchKind := matchLocalAccount(localRows, remote); matched != nil {
+		s.applyCPAErrorToMatchedAccount(ctx, record, kind, remote, matched, matchKind, cache, state, metrics)
+		return
+	}
+
+	if isCPABannedErrorKind(kind) {
+		s.recordAction(state, "reconcile", "warning", "no unique local account match found", record.Name)
+		return
+	}
+
+	if localAccountCandidateCount(localRows, remote) != 0 {
+		s.recordAction(state, "reconcile", "warning", "no unique local account match found", record.Name)
+		return
+	}
+
+	importedID, importName, err := s.importRemoteAccount(ctx, remote)
+	if err != nil {
+		s.recordAction(state, "reconcile", "error", fmt.Sprintf("create local account failed: %v", err), record.Name)
+		metrics.setFirstErrorf("create local account failed: %v", err)
+		return
+	}
+	s.recordAction(state, "reconcile", "success", fmt.Sprintf("created local account %s from CPA", importName), record.Name)
+	s.db.InsertAccountEventAsync(importedID, "added", "cpa_sync")
+	if isCPARateLimitedErrorKind(kind) {
+		s.markRateLimited(importedID, record.StatusMessage)
+	}
+	cache.invalidate()
+}
+
+func (s *CPASyncService) applyCPAErrorToMatchedAccount(
+	ctx context.Context,
+	record cpaAuthFileRecord,
+	kind string,
+	remote *cpaDownloadedAccount,
+	matched *database.AccountRow,
+	matchKind string,
+	cache *cpaLocalAccountCache,
+	state *database.CPASyncState,
+	metrics *cpaRunMetrics,
+) {
+	delta := buildCredentialDelta(matched, remote)
+	if len(delta) > 0 {
+		if err := s.db.UpdateCredentials(ctx, matched.ID, delta); err != nil {
+			s.recordAction(state, "reconcile", "error", fmt.Sprintf("update local credentials failed: %v", err), record.Name)
+			metrics.setFirstErrorf("update local credentials failed: %v", err)
+			return
+		}
+		s.applyInMemoryCredentials(matched.ID, remote)
+		s.recordAction(state, "reconcile", "success", fmt.Sprintf("updated local credentials via %s", matchKind), record.Name)
+		cache.invalidate()
+	}
+	if isCPABannedErrorKind(kind) {
+		s.markUnauthorized(matched.ID)
+		return
+	}
+	if isCPARateLimitedErrorKind(kind) {
+		s.markRateLimited(matched.ID, record.StatusMessage)
+	}
+}
+
+func (s *CPASyncService) uploadMissingCPAAccounts(
+	ctx context.Context,
+	settings *cpaSyncSettings,
+	state *database.CPASyncState,
+	effectiveRecords []cpaAuthFileRecord,
+	downloadedTokens map[string]struct{},
+	targetCount int,
+	metrics *cpaRunMetrics,
+) []cpaAuthFileRecord {
+	if len(effectiveRecords) >= targetCount {
+		return effectiveRecords
+	}
+
+	remaining := targetCount - len(effectiveRecords)
+	if settings.MaxAccounts > 0 {
+		room := settings.MaxAccounts - len(effectiveRecords)
+		if room < remaining {
+			remaining = room
+		}
+	}
+	if remaining <= 0 {
+		return effectiveRecords
+	}
+
+	candidates, err := s.selectVerifiedUploadCandidates(ctx, effectiveRecords, downloadedTokens, remaining, state)
+	if err != nil {
+		s.recordAction(state, "upload", "error", fmt.Sprintf("select candidates failed: %v", err), "")
+		metrics.setFirstErrorf("select upload candidates failed: %v", err)
+		return effectiveRecords
+	}
+
+	for _, candidate := range candidates {
+		name := buildCPAAuthFileName(candidate.Entry)
+		if err := s.uploadCPAAuthFile(ctx, settings, name, candidate.Entry); err != nil {
+			s.recordAction(state, "upload", "error", fmt.Sprintf("upload failed: %v", err), name)
+			metrics.setFirstErrorf("upload %s failed: %v", name, err)
+			continue
+		}
+		metrics.UploadedRemote = true
+		metrics.UploadedCount++
+		effectiveRecords = append(effectiveRecords, cpaAuthFileRecord{
+			Name:   name,
+			Email:  candidate.Entry.Email,
+			Status: "active",
+		})
+		s.recordAction(state, "upload", "success", fmt.Sprintf("uploaded %s", candidate.Entry.Email), name)
+	}
+
+	return effectiveRecords
+}
+
+func (s *CPASyncService) refreshCPARecordsAfterRemoteChanges(
+	ctx context.Context,
+	settings *cpaSyncSettings,
+	state *database.CPASyncState,
+	records []cpaAuthFileRecord,
+	effectiveRecords []cpaAuthFileRecord,
+	metrics *cpaRunMetrics,
+) ([]cpaAuthFileRecord, []cpaAuthFileRecord) {
+	if metrics == nil || (!metrics.DeletedRemote && !metrics.UploadedRemote) {
+		return records, effectiveRecords
+	}
+
+	refreshed, err := s.listCPAAuthFiles(ctx, settings)
+	if err != nil {
+		s.recordAction(state, "run", "warning", fmt.Sprintf("final CPA auth file recount failed: %v", err), "")
+		metrics.appendErrorf("final CPA auth file recount failed: %v", err)
+		return records, effectiveRecords
+	}
+
+	return refreshed, filterEffectiveCPAAuthFileRecords(refreshed)
+}
+
+func addDownloadedAccountTokens(downloadedTokens map[string]struct{}, remote *cpaDownloadedAccount) {
+	if downloadedTokens == nil || remote == nil {
+		return
+	}
+	if remote.RefreshToken != "" {
+		downloadedTokens["rt:"+remote.RefreshToken] = struct{}{}
+	}
+	if remote.AccessToken != "" {
+		downloadedTokens["at:"+remote.AccessToken] = struct{}{}
+	}
 }
 
 func (c *cpaSyncSettings) missingMihomoConfig() []string {
@@ -708,16 +946,16 @@ func (c *cpaSyncSettings) interval() time.Duration {
 	return c.Interval
 }
 
-func (c *cpaSyncSettings) switchCooldown() time.Duration {
+func (c *cpaSyncSettings) bannedDeleteSwitchWindow() time.Duration {
 	if c == nil || c.SwitchAfterUploads <= 0 {
 		return 0
 	}
 	return time.Duration(c.SwitchAfterUploads) * time.Minute
 }
 
-func (c *cpaSyncSettings) uploadSwitchWindow() time.Duration {
-	if cooldown := c.switchCooldown(); cooldown > 0 {
-		return cooldown
+func (c *cpaSyncSettings) effectiveSwitchWindow() time.Duration {
+	if window := c.bannedDeleteSwitchWindow(); window > 0 {
+		return window
 	}
 	return time.Hour
 }
@@ -756,7 +994,7 @@ func (s *CPASyncService) normalizeState(state *database.CPASyncState, settings *
 	windowStart := now.UTC()
 	windowDuration := time.Hour
 	if settings != nil {
-		windowDuration = settings.uploadSwitchWindow()
+		windowDuration = settings.effectiveSwitchWindow()
 	}
 	if state.HourBucketStart != "" {
 		if parsed, err := time.Parse(time.RFC3339, state.HourBucketStart); err == nil && !parsed.IsZero() {
@@ -783,7 +1021,7 @@ func (s *CPASyncService) normalizeState(state *database.CPASyncState, settings *
 	return changed
 }
 
-func (s *CPASyncService) shouldAutoSwitchForHourlyLimit(state *database.CPASyncState, settings *cpaSyncSettings, now time.Time) (bool, string) {
+func (s *CPASyncService) shouldAutoSwitchForBannedDeleteThreshold(state *database.CPASyncState, settings *cpaSyncSettings) (bool, string) {
 	if state == nil || settings == nil {
 		return false, ""
 	}
@@ -839,6 +1077,51 @@ func (s *CPASyncService) recordStateFailure(state *database.CPASyncState, status
 	s.recordAction(state, "run", "error", message, "")
 }
 
+func (s *CPASyncService) probeUploadCandidate(ctx context.Context, account *auth.Account) uploadCandidateProbeResult {
+	if s == nil || account == nil {
+		return uploadCandidateProbeResult{State: uploadCandidateProbeUnknown, Message: "account is nil"}
+	}
+
+	payload := buildTestPayload(s.store.GetTestModel())
+	proxyOverride := s.store.ResolveMaintenanceProxy(ctx, account)
+	resp, err := proxy.ExecuteRequest(ctx, account, payload, "", proxyOverride, "", nil, nil)
+	if err != nil {
+		return uploadCandidateProbeResult{State: uploadCandidateProbeUnknown, Message: err.Error()}
+	}
+	defer resp.Body.Close()
+
+	usagePct, hasUsage := proxy.ParseCodexUsageHeaders(resp, account)
+	if hasUsage {
+		s.store.PersistUsageSnapshot(account, usagePct)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		s.store.ReportRequestSuccess(account, 0)
+		if !hasUsage || usagePct < 100 {
+			s.store.ClearCooldown(account)
+		}
+		return uploadCandidateProbeResult{State: uploadCandidateProbeActive}
+	case http.StatusUnauthorized:
+		s.store.ReportRequestFailure(account, "client", 0)
+		return uploadCandidateProbeResult{State: uploadCandidateProbeUnauthorized, Message: "unauthorized"}
+	case http.StatusTooManyRequests:
+		s.store.ReportRequestFailure(account, "client", 0)
+		return uploadCandidateProbeResult{State: uploadCandidateProbeRateLimited, Message: "rate_limited"}
+	default:
+		if resp.StatusCode >= 500 {
+			s.store.ReportRequestFailure(account, "server", 0)
+		} else if resp.StatusCode >= 400 {
+			s.store.ReportRequestFailure(account, "client", 0)
+		}
+		return uploadCandidateProbeResult{
+			State:   uploadCandidateProbeUnknown,
+			Message: fmt.Sprintf("probe returned HTTP %d", resp.StatusCode),
+		}
+	}
+}
+
 func (s *CPASyncService) runCPAConnectionTest(ctx context.Context, settings *cpaSyncSettings) database.ConnectionTestStatus {
 	testedAt := time.Now().UTC().Format(time.RFC3339)
 	if missing := settings.missingCPAConfig(); len(missing) > 0 {
@@ -853,9 +1136,10 @@ func (s *CPASyncService) runCPAConnectionTest(ctx context.Context, settings *cpa
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, settings.CPABaseURL+"/v0/management/auth-files", nil)
 	if err != nil {
+		log.Printf("[CPA Sync] build CPA test request failed: %v", err)
 		return database.ConnectionTestStatus{
 			Ok:       boolPtr(false),
-			Message:  err.Error(),
+			Message:  "build CPA request failed",
 			TestedAt: testedAt,
 			Details:  map[string]any{},
 		}
@@ -863,21 +1147,33 @@ func (s *CPASyncService) runCPAConnectionTest(ctx context.Context, settings *cpa
 	s.applyCPAHeaders(req, settings.CPAAdminKey)
 	resp, err := s.client.Do(req)
 	if err != nil {
+		log.Printf("[CPA Sync] CPA test request failed: %v", err)
 		return database.ConnectionTestStatus{
 			Ok:       boolPtr(false),
-			Message:  err.Error(),
+			Message:  "request CPA failed",
 			TestedAt: testedAt,
 			Details:  map[string]any{"duration_ms": time.Since(start).Milliseconds()},
 		}
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := readBodyLimited(resp.Body, cpaSyncMaxResponseBody)
 	durationMs := time.Since(start).Milliseconds()
 	httpStatus := resp.StatusCode
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if readErr != nil {
+		log.Printf("[CPA Sync] read CPA test response failed: %v", readErr)
 		return database.ConnectionTestStatus{
 			Ok:         boolPtr(false),
-			Message:    fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body))),
+			Message:    "read CPA response failed",
+			HTTPStatus: intPtr(httpStatus),
+			TestedAt:   testedAt,
+			Details:    map[string]any{"duration_ms": durationMs},
+		}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("[CPA Sync] CPA test upstream failed status=%d body=%s", resp.StatusCode, truncate(strings.TrimSpace(string(body)), 500))
+		return database.ConnectionTestStatus{
+			Ok:         boolPtr(false),
+			Message:    fmt.Sprintf("HTTP %d", resp.StatusCode),
 			HTTPStatus: intPtr(httpStatus),
 			TestedAt:   testedAt,
 			Details:    map[string]any{"duration_ms": durationMs},
@@ -885,9 +1181,10 @@ func (s *CPASyncService) runCPAConnectionTest(ctx context.Context, settings *cpa
 	}
 	records, err := parseCPAAuthFiles(body)
 	if err != nil {
+		log.Printf("[CPA Sync] parse CPA test response failed: %v", err)
 		return database.ConnectionTestStatus{
 			Ok:         boolPtr(false),
-			Message:    fmt.Sprintf("parse CPA response failed: %v", err),
+			Message:    "parse CPA response failed",
 			HTTPStatus: intPtr(httpStatus),
 			TestedAt:   testedAt,
 			Details:    map[string]any{"duration_ms": durationMs},
@@ -921,9 +1218,10 @@ func (s *CPASyncService) runMihomoConnectionTest(ctx context.Context, settings *
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/proxies/%s", settings.MihomoBaseURL, url.PathEscape(settings.MihomoStrategyGroup)), nil)
 	if err != nil {
+		log.Printf("[CPA Sync] build Mihomo test request failed: %v", err)
 		return database.ConnectionTestStatus{
 			Ok:       boolPtr(false),
-			Message:  err.Error(),
+			Message:  "build Mihomo request failed",
 			TestedAt: testedAt,
 			Details:  map[string]any{},
 		}
@@ -931,21 +1229,33 @@ func (s *CPASyncService) runMihomoConnectionTest(ctx context.Context, settings *
 	req.Header.Set("Authorization", "Bearer "+settings.MihomoSecret)
 	resp, err := s.client.Do(req)
 	if err != nil {
+		log.Printf("[CPA Sync] Mihomo test request failed: %v", err)
 		return database.ConnectionTestStatus{
 			Ok:       boolPtr(false),
-			Message:  err.Error(),
+			Message:  "request Mihomo failed",
 			TestedAt: testedAt,
 			Details:  map[string]any{"duration_ms": time.Since(start).Milliseconds()},
 		}
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := readBodyLimited(resp.Body, cpaSyncMaxResponseBody)
 	durationMs := time.Since(start).Milliseconds()
 	httpStatus := resp.StatusCode
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if readErr != nil {
+		log.Printf("[CPA Sync] read Mihomo test response failed: %v", readErr)
 		return database.ConnectionTestStatus{
 			Ok:         boolPtr(false),
-			Message:    fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body))),
+			Message:    "read Mihomo response failed",
+			HTTPStatus: intPtr(httpStatus),
+			TestedAt:   testedAt,
+			Details:    map[string]any{"duration_ms": durationMs},
+		}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("[CPA Sync] Mihomo test upstream failed status=%d body=%s", resp.StatusCode, truncate(strings.TrimSpace(string(body)), 500))
+		return database.ConnectionTestStatus{
+			Ok:         boolPtr(false),
+			Message:    fmt.Sprintf("HTTP %d", resp.StatusCode),
 			HTTPStatus: intPtr(httpStatus),
 			TestedAt:   testedAt,
 			Details:    map[string]any{"duration_ms": durationMs},
@@ -953,9 +1263,10 @@ func (s *CPASyncService) runMihomoConnectionTest(ctx context.Context, settings *
 	}
 	var detail mihomoSelectorDetail
 	if err := json.Unmarshal(body, &detail); err != nil {
+		log.Printf("[CPA Sync] parse Mihomo test response failed: %v", err)
 		return database.ConnectionTestStatus{
 			Ok:         boolPtr(false),
-			Message:    fmt.Sprintf("parse Mihomo response failed: %v", err),
+			Message:    "parse Mihomo response failed",
 			HTTPStatus: intPtr(httpStatus),
 			TestedAt:   testedAt,
 			Details:    map[string]any{"duration_ms": durationMs},
@@ -1003,7 +1314,10 @@ func (s *CPASyncService) runMihomoDelayTest(ctx context.Context, settings *cpaSy
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := readBodyLimited(resp.Body, cpaSyncMaxResponseBody)
+	if readErr != nil {
+		return nil, fmt.Errorf("read delay response failed: %w", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("delay test failed: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -1041,7 +1355,10 @@ func (s *CPASyncService) listCPAAuthFiles(ctx context.Context, settings *cpaSync
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := readBodyLimited(resp.Body, cpaSyncMaxResponseBody)
+	if readErr != nil {
+		return nil, fmt.Errorf("read CPA auth files failed: %w", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -1060,7 +1377,10 @@ func (s *CPASyncService) downloadCPAAuthFile(ctx context.Context, settings *cpaS
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := readBodyLimited(resp.Body, cpaSyncMaxResponseBody)
+	if readErr != nil {
+		return nil, fmt.Errorf("read CPA auth file failed: %w", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -1079,7 +1399,10 @@ func (s *CPASyncService) deleteCPAAuthFile(ctx context.Context, settings *cpaSyn
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := readBodyLimited(resp.Body, cpaSyncMaxResponseBody)
+	if readErr != nil {
+		return fmt.Errorf("read CPA delete response failed: %w", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -1130,8 +1453,12 @@ func (s *CPASyncService) uploadCPAAuthFile(ctx context.Context, settings *cpaSyn
 			lastErr = err
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := readBodyLimited(resp.Body, cpaSyncMaxResponseBody)
 		resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("read CPA upload response failed: %w", readErr)
+			continue
+		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return nil
 		}
@@ -1143,8 +1470,69 @@ func (s *CPASyncService) uploadCPAAuthFile(ctx context.Context, settings *cpaSyn
 	return lastErr
 }
 
-func (s *CPASyncService) selectUploadCandidates(ctx context.Context, records []cpaAuthFileRecord, downloadedTokens map[string]struct{}, limit int) ([]cpaExportEntry, error) {
-	rows, err := s.db.ListActive(ctx)
+func (s *CPASyncService) selectVerifiedUploadCandidates(
+	ctx context.Context,
+	records []cpaAuthFileRecord,
+	downloadedTokens map[string]struct{},
+	limit int,
+	state *database.CPASyncState,
+) ([]cpaUploadCandidate, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	excluded := make(map[int64]struct{})
+	selected := make([]cpaUploadCandidate, 0, limit)
+	for len(selected) < limit {
+		batch, err := s.selectUploadCandidates(ctx, records, downloadedTokens, limit-len(selected), excluded)
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+
+		for _, candidate := range batch {
+			excluded[candidate.DBID] = struct{}{}
+			account := s.runtimeAccountByDBID(candidate.DBID)
+			if account == nil {
+				continue
+			}
+
+			probe := s.uploadProbe(ctx, account)
+			switch probe.State {
+			case uploadCandidateProbeUnauthorized:
+				s.markUnauthorized(candidate.DBID)
+				s.recordAction(state, "upload", "warning", fmt.Sprintf("skip banned account %s during upload selection", candidate.Entry.Email), candidate.Entry.Email)
+				continue
+			case uploadCandidateProbeRateLimited:
+				s.markRateLimited(candidate.DBID, probe.Message)
+				s.recordAction(state, "upload", "warning", fmt.Sprintf("skip rate limited account %s during upload selection", candidate.Entry.Email), candidate.Entry.Email)
+				continue
+			case uploadCandidateProbeUnknown:
+				if probe.Message != "" {
+					s.recordAction(state, "upload", "warning", fmt.Sprintf("probe account %s inconclusive: %s", candidate.Entry.Email, probe.Message), candidate.Entry.Email)
+				}
+			}
+
+			selected = append(selected, candidate)
+			if len(selected) >= limit {
+				break
+			}
+		}
+	}
+
+	return selected, nil
+}
+
+func (s *CPASyncService) selectUploadCandidates(
+	ctx context.Context,
+	records []cpaAuthFileRecord,
+	downloadedTokens map[string]struct{},
+	limit int,
+	excluded map[int64]struct{},
+) ([]cpaUploadCandidate, error) {
+	rows, err := s.db.ListAllAccounts(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1166,10 +1554,13 @@ func (s *CPASyncService) selectUploadCandidates(ctx context.Context, records []c
 		}
 	}
 
-	selected := make([]cpaExportEntry, 0, limit)
+	selected := make([]cpaUploadCandidate, 0, limit)
 	for _, row := range rows {
 		if len(selected) >= limit {
 			break
+		}
+		if _, skip := excluded[row.ID]; skip {
+			continue
 		}
 		account, ok := runtimeMap[row.ID]
 		if !ok || account.RuntimeStatus() != "active" {
@@ -1192,15 +1583,18 @@ func (s *CPASyncService) selectUploadCandidates(ctx context.Context, records []c
 				continue
 			}
 		}
-		selected = append(selected, cpaExportEntry{
-			Type:         "codex",
-			Email:        email,
-			Expired:      row.GetCredential("expires_at"),
-			IDToken:      row.GetCredential("id_token"),
-			AccountID:    row.GetCredential("account_id"),
-			AccessToken:  accessToken,
-			LastRefresh:  row.UpdatedAt.UTC().Format(time.RFC3339),
-			RefreshToken: refreshToken,
+		selected = append(selected, cpaUploadCandidate{
+			DBID: row.ID,
+			Entry: cpaExportEntry{
+				Type:         "codex",
+				Email:        email,
+				Expired:      row.GetCredential("expires_at"),
+				IDToken:      row.GetCredential("id_token"),
+				AccountID:    row.GetCredential("account_id"),
+				AccessToken:  accessToken,
+				LastRefresh:  row.UpdatedAt.UTC().Format(time.RFC3339),
+				RefreshToken: refreshToken,
+			},
 		})
 		existingEmails[strings.ToLower(email)] = struct{}{}
 		downloadedTokens["rt:"+refreshToken] = struct{}{}
@@ -1209,6 +1603,18 @@ func (s *CPASyncService) selectUploadCandidates(ctx context.Context, records []c
 		}
 	}
 	return selected, nil
+}
+
+func (s *CPASyncService) runtimeAccountByDBID(dbID int64) *auth.Account {
+	if s == nil || dbID == 0 {
+		return nil
+	}
+	for _, account := range s.store.Accounts() {
+		if account != nil && account.DBID == dbID {
+			return account
+		}
+	}
+	return nil
 }
 
 func (s *CPASyncService) switchMihomo(ctx context.Context, settings *cpaSyncSettings, state *database.CPASyncState, reason string) error {
@@ -1242,7 +1648,7 @@ func (s *CPASyncService) switchMihomo(ctx context.Context, settings *cpaSyncSett
 			Now: candidate,
 			All: append([]string{}, detail.All...),
 		}, switchAt)
-		if reason == "hourly_upload_limit" {
+		if reason == cpaSwitchReasonThreshold {
 			state.HourBucketStart = switchAt.Format(time.RFC3339)
 			state.HourlyUploadCount = 0
 		}
@@ -1293,7 +1699,10 @@ func (s *CPASyncService) setMihomoSelector(ctx context.Context, settings *cpaSyn
 		return err
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, readErr := readBodyLimited(resp.Body, cpaSyncMaxResponseBody)
+	if readErr != nil {
+		return fmt.Errorf("read Mihomo switch response failed: %w", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
@@ -1316,7 +1725,10 @@ func (s *CPASyncService) getMihomoSelector(ctx context.Context, settings *cpaSyn
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := readBodyLimited(resp.Body, cpaSyncMaxResponseBody)
+	if readErr != nil {
+		return nil, fmt.Errorf("read Mihomo selector failed: %w", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -1338,7 +1750,10 @@ func (s *CPASyncService) fetchMihomoStrategyGroups(ctx context.Context, settings
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := readBodyLimited(resp.Body, cpaSyncMaxResponseBody)
+	if readErr != nil {
+		return nil, fmt.Errorf("read Mihomo proxies failed: %w", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -1371,6 +1786,76 @@ func normalizeConnectionTestStatus(status database.ConnectionTestStatus) databas
 		status.Details = map[string]any{}
 	}
 	return status
+}
+
+func sanitizeCPASyncPublicMessage(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ""
+	}
+
+	if strings.Contains(message, "; ") {
+		parts := strings.Split(message, "; ")
+		for i, part := range parts {
+			parts[i] = sanitizeCPASyncPublicMessage(part)
+		}
+		return strings.Join(parts, "; ")
+	}
+
+	if strings.HasPrefix(message, "missing config: ") {
+		return message
+	}
+	if strings.HasPrefix(message, "HTTP ") {
+		if idx := strings.Index(message, ":"); idx > 0 {
+			return strings.TrimSpace(message[:idx])
+		}
+		return message
+	}
+	if idx := strings.Index(message, " inconclusive:"); idx >= 0 {
+		return strings.TrimSpace(message[:idx+len(" inconclusive")])
+	}
+	if idx := strings.Index(message, " failed:"); idx >= 0 {
+		return strings.TrimSpace(message[:idx+len(" failed")])
+	}
+
+	return message
+}
+
+func sanitizeConnectionTestStatusForAPI(status database.ConnectionTestStatus) database.ConnectionTestStatus {
+	status = normalizeConnectionTestStatus(status)
+	status.Message = sanitizeCPASyncPublicMessage(status.Message)
+	if status.Details != nil {
+		cloned := make(map[string]any, len(status.Details))
+		for key, value := range status.Details {
+			cloned[key] = value
+		}
+		status.Details = cloned
+	}
+	return status
+}
+
+func sanitizeCPASyncStateForAPI(state *database.CPASyncState) *database.CPASyncState {
+	if state == nil {
+		return nil
+	}
+
+	cloned := *state
+	cloned.LastRunSummary = sanitizeCPASyncPublicMessage(state.LastRunSummary)
+	cloned.LastErrorSummary = sanitizeCPASyncPublicMessage(state.LastErrorSummary)
+	cloned.CPATestStatus = sanitizeConnectionTestStatusForAPI(state.CPATestStatus)
+	cloned.MihomoTestStatus = sanitizeConnectionTestStatusForAPI(state.MihomoTestStatus)
+
+	if len(state.RecentActions) > 0 {
+		cloned.RecentActions = make([]database.CPASyncAction, len(state.RecentActions))
+		for i, action := range state.RecentActions {
+			cloned.RecentActions[i] = action
+			cloned.RecentActions[i].Message = sanitizeCPASyncPublicMessage(action.Message)
+		}
+	} else {
+		cloned.RecentActions = []database.CPASyncAction{}
+	}
+
+	return &cloned
 }
 
 func (s *CPASyncService) syncCPAStateFromTestStatus(state *database.CPASyncState, status database.ConnectionTestStatus) {
@@ -1614,26 +2099,26 @@ func detectCPAErrorKind(statusMessage string) string {
 	var decoded map[string]any
 	if json.Unmarshal([]byte(statusMessage), &decoded) == nil {
 		errorObj := unwrapObject(decoded["error"])
-		if firstString(errorObj, "type") == "usage_limit_reached" {
-			return "usage_limit_reached"
+		if firstString(errorObj, "type") == cpaErrorKindUsageLimitReached {
+			return cpaErrorKindUsageLimitReached
 		}
-		if firstString(errorObj, "code") == "account_deactivated" {
-			return "account_deactivated"
+		if firstString(errorObj, "code") == cpaErrorKindAccountDeactivated {
+			return cpaErrorKindAccountDeactivated
 		}
-		if firstString(errorObj, "code") == "token_invalidated" {
-			return "token_invalidated"
+		if firstString(errorObj, "code") == cpaErrorKindTokenInvalidated {
+			return cpaErrorKindTokenInvalidated
 		}
 	}
 	lower := strings.ToLower(statusMessage)
 	switch {
-	case strings.Contains(lower, "usage_limit_reached"):
-		return "usage_limit_reached"
-	case strings.Contains(lower, "account_deactivated"):
-		return "account_deactivated"
-	case strings.Contains(lower, "token_invalidated"),
+	case strings.Contains(lower, cpaErrorKindUsageLimitReached):
+		return cpaErrorKindUsageLimitReached
+	case strings.Contains(lower, cpaErrorKindAccountDeactivated):
+		return cpaErrorKindAccountDeactivated
+	case strings.Contains(lower, cpaErrorKindTokenInvalidated),
 		strings.Contains(lower, "authentication token has been invalidated"),
 		strings.Contains(lower, "signing in again"):
-		return "token_invalidated"
+		return cpaErrorKindTokenInvalidated
 	default:
 		return ""
 	}
@@ -1649,7 +2134,7 @@ func parseCPAUsageLimitResetAt(statusMessage string, now time.Time) (time.Time, 
 		return time.Time{}, false
 	}
 	errorObj := unwrapObject(decoded["error"])
-	if firstString(errorObj, "type") != "usage_limit_reached" {
+	if firstString(errorObj, "type") != cpaErrorKindUsageLimitReached {
 		return time.Time{}, false
 	}
 	if unix, ok := int64FromAny(errorObj["resets_at"]); ok && unix > 0 {
@@ -1659,6 +2144,19 @@ func parseCPAUsageLimitResetAt(statusMessage string, now time.Time) (time.Time, 
 		return now.Add(time.Duration(seconds) * time.Second), true
 	}
 	return time.Time{}, false
+}
+
+func isCPABannedErrorKind(kind string) bool {
+	switch kind {
+	case cpaErrorKindAccountDeactivated, cpaErrorKindTokenInvalidated:
+		return true
+	default:
+		return false
+	}
+}
+
+func isCPARateLimitedErrorKind(kind string) bool {
+	return kind == cpaErrorKindUsageLimitReached
 }
 
 func boolFromAny(value any) bool {
@@ -1888,6 +2386,11 @@ func (s *CPASyncService) importRemoteAccount(ctx context.Context, remote *cpaDow
 	credentials := buildRemoteCredentialPayload(remote)
 	if len(credentials) > 0 {
 		if err := s.db.UpdateCredentials(ctx, id, credentials); err != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if cleanupErr := s.db.SetError(cleanupCtx, id, "deleted"); cleanupErr != nil {
+				log.Printf("[CPA Sync] rollback imported account %d failed: %v", id, cleanupErr)
+			}
+			cleanupCancel()
 			return 0, "", err
 		}
 	}
@@ -1912,6 +2415,21 @@ func (s *CPASyncService) importRemoteAccount(ctx context.Context, remote *cpaDow
 	s.store.AddAccount(account)
 
 	return id, name, nil
+}
+
+func readBodyLimited(body io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		maxBytes = cpaSyncMaxResponseBody
+	}
+	limited := io.LimitReader(body, maxBytes+1)
+	payload, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) > maxBytes {
+		return nil, fmt.Errorf("response body too large: limit=%d", maxBytes)
+	}
+	return payload, nil
 }
 
 func buildCredentialDelta(row *database.AccountRow, remote *cpaDownloadedAccount) map[string]interface{} {
@@ -2040,7 +2558,7 @@ func (h *Handler) GetCPASyncStatus(c *gin.Context) {
 	defer cancel()
 	status, err := h.cpaSync.Status(ctx)
 	if err != nil {
-		writeInternalError(c, err)
+		writeLoggedInternalError(c, "获取 CPA 联动状态失败", err)
 		return
 	}
 	c.JSON(http.StatusOK, status)
@@ -2059,7 +2577,7 @@ func (h *Handler) RunCPASync(c *gin.Context) {
 			writeError(c, http.StatusConflict, err.Error())
 			return
 		}
-		writeInternalError(c, err)
+		writeLoggedInternalError(c, "执行 CPA 联动失败", err)
 		return
 	}
 	c.JSON(http.StatusOK, status)
@@ -2078,7 +2596,7 @@ func (h *Handler) SwitchCPASyncMihomo(c *gin.Context) {
 			writeError(c, http.StatusConflict, err.Error())
 			return
 		}
-		writeInternalError(c, err)
+		writeLoggedInternalError(c, "切换 Mihomo 节点失败", err)
 		return
 	}
 	c.JSON(http.StatusOK, status)
@@ -2100,7 +2618,12 @@ func (h *Handler) TestCPASyncCPA(c *gin.Context) {
 	defer cancel()
 	status, err := h.cpaSync.TestCPA(ctx, &req)
 	if err != nil {
-		writeInternalError(c, err)
+		var validationErr *requestValidationError
+		if errors.As(err, &validationErr) {
+			writeError(c, http.StatusBadRequest, validationErr.Error())
+			return
+		}
+		writeLoggedInternalError(c, "测试 CPA 连接失败", err)
 		return
 	}
 	c.JSON(http.StatusOK, status)
@@ -2122,7 +2645,12 @@ func (h *Handler) TestCPASyncMihomo(c *gin.Context) {
 	defer cancel()
 	status, err := h.cpaSync.TestMihomo(ctx, &req)
 	if err != nil {
-		writeInternalError(c, err)
+		var validationErr *requestValidationError
+		if errors.As(err, &validationErr) {
+			writeError(c, http.StatusBadRequest, validationErr.Error())
+			return
+		}
+		writeLoggedInternalError(c, "测试 Mihomo 连接失败", err)
 		return
 	}
 	c.JSON(http.StatusOK, status)
@@ -2144,7 +2672,12 @@ func (h *Handler) ListCPASyncMihomoGroups(c *gin.Context) {
 	defer cancel()
 	groups, err := h.cpaSync.ListMihomoStrategyGroups(ctx, &req)
 	if err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
+		var validationErr *requestValidationError
+		if errors.As(err, &validationErr) {
+			writeError(c, http.StatusBadRequest, validationErr.Error())
+			return
+		}
+		writeLoggedInternalError(c, "加载 Mihomo 策略组失败", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"groups": groups})

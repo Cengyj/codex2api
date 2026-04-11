@@ -21,6 +21,12 @@ import (
 
 var executeRequest = proxy.ExecuteRequest
 
+const (
+	maxTestErrorBodyBytes = 256 * 1024
+	maxBatchDrainBytes    = 512 * 1024
+	batchTestTimeout      = 45 * time.Second
+)
+
 // testEvent SSE 测试事件
 type testEvent struct {
 	Type    string `json:"type"`              // test_start | content | test_complete | error
@@ -30,12 +36,16 @@ type testEvent struct {
 	Error   string `json:"error,omitempty"`   // 错误信息
 }
 
+func canStreamTestEvent(c *gin.Context) bool {
+	return c != nil && c.Request != nil && c.Request.Context().Err() == nil
+}
+
 // TestConnection 测试账号连接（SSE 流式返回）
 // GET /api/admin/accounts/:id/test
 func (h *Handler) TestConnection(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
+	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的账号 ID"})
 		return
 	}
@@ -62,22 +72,27 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
-	c.Writer.Flush()
+	if canStreamTestEvent(c) {
+		c.Writer.Flush()
+	}
 
 	testModel := h.store.GetTestModel()
 
 	// 发送 test_start
-	sendTestEvent(c, testEvent{Type: "test_start", Model: testModel})
+	if !sendTestEvent(c, testEvent{Type: "test_start", Model: testModel}) {
+		return
+	}
 
 	// 构建最小测试请求体（参考 sub2api createOpenAITestPayload）
 	payload := buildTestPayload(testModel)
 
 	// 发送请求
 	start := time.Now()
-	proxyOverride := h.store.EffectiveProxyURL(account)
+	proxyOverride := h.store.ResolveMaintenanceProxy(c.Request.Context(), account)
 	resp, reqErr := executeRequest(c.Request.Context(), account, payload, "", proxyOverride, "", nil, nil)
 	if reqErr != nil {
-		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("请求失败: %s", reqErr.Error())})
+		log.Printf("[admin] test connection request failed account=%d: %v", id, reqErr)
+		_ = sendTestEvent(c, testEvent{Type: "error", Error: "请求失败"})
 		return
 	}
 	defer resp.Body.Close()
@@ -92,8 +107,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		case http.StatusTooManyRequests:
 			h.store.MarkCooldown(account, 5*time.Minute, "rate_limited")
 		}
-		errBody, _ := io.ReadAll(resp.Body)
-		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))})
+		errBody, _ := readLimitedBytes(resp.Body, maxTestErrorBodyBytes)
+		log.Printf("[admin] test connection upstream error account=%d status=%d body=%s", id, resp.StatusCode, truncate(string(errBody), 500))
+		_ = sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d", resp.StatusCode)})
 		return
 	}
 
@@ -105,6 +121,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	// 解析 SSE 流
 	hasContent := false
 	_ = proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
+		if !canStreamTestEvent(c) {
+			return false
+		}
+
 		eventType := gjson.GetBytes(data, "type").String()
 
 		switch eventType {
@@ -112,7 +132,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			delta := gjson.GetBytes(data, "delta").String()
 			if delta != "" {
 				hasContent = true
-				sendTestEvent(c, testEvent{Type: "content", Text: delta})
+				if !sendTestEvent(c, testEvent{Type: "content", Text: delta}) {
+					return false
+				}
 			}
 		case "response.completed":
 			// 只有用量未耗尽时才重置状态
@@ -120,25 +142,28 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				h.store.ClearCooldown(account)
 			}
 			duration := time.Since(start).Milliseconds()
-			sendTestEvent(c, testEvent{
+			if !sendTestEvent(c, testEvent{
 				Type: "content",
 				Text: fmt.Sprintf("\n\n--- 耗时 %dms ---", duration),
-			})
-			sendTestEvent(c, testEvent{Type: "test_complete", Success: true})
+			}) {
+				return false
+			}
+			_ = sendTestEvent(c, testEvent{Type: "test_complete", Success: true})
 			return false
 		case "response.failed":
 			errMsg := gjson.GetBytes(data, "response.status_details.error.message").String()
 			if errMsg == "" {
-				errMsg = "上游返回 response.failed"
+				errMsg = string(data)
 			}
-			sendTestEvent(c, testEvent{Type: "error", Error: errMsg})
+			log.Printf("[admin] test connection response.failed account=%d detail=%s", id, truncate(errMsg, 500))
+			_ = sendTestEvent(c, testEvent{Type: "error", Error: "上游返回 response.failed"})
 			return false
 		}
 		return true
 	})
 
 	if !hasContent {
-		sendTestEvent(c, testEvent{Type: "error", Error: "未收到模型输出"})
+		_ = sendTestEvent(c, testEvent{Type: "error", Error: "未收到模型输出"})
 	}
 }
 
@@ -164,17 +189,39 @@ func buildTestPayload(model string) []byte {
 }
 
 // sendTestEvent 发送 SSE 事件
-func sendTestEvent(c *gin.Context, event testEvent) {
+func sendTestEvent(c *gin.Context, event testEvent) bool {
+	if !canStreamTestEvent(c) {
+		return false
+	}
+
 	data, err := json.Marshal(event)
 	if err != nil {
 		log.Printf("序列化测试事件失败: %v", err)
-		return
+		return false
 	}
 	if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", data); err != nil {
 		log.Printf("写入 SSE 事件失败: %v", err)
-		return
+		return false
 	}
-	c.Writer.Flush()
+	if canStreamTestEvent(c) {
+		c.Writer.Flush()
+	}
+	return true
+}
+
+func readLimitedBytes(r io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		maxBytes = maxTestErrorBodyBytes
+	}
+	limited := io.LimitReader(r, maxBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return data[:maxBytes], nil
+	}
+	return data, nil
 }
 
 // truncate 截断字符串
@@ -197,6 +244,9 @@ func (h *Handler) BatchTest(c *gin.Context) {
 	testModel := h.store.GetTestModel()
 	payload := buildTestPayload(testModel)
 	concurrency := h.store.GetTestConcurrency()
+	if concurrency <= 0 {
+		concurrency = 1
+	}
 
 	var (
 		successCount   int64
@@ -204,11 +254,57 @@ func (h *Handler) BatchTest(c *gin.Context) {
 		bannedCount    int64
 		rateLimitCount int64
 		wg             sync.WaitGroup
-		sem            = make(chan struct{}, concurrency)
 	)
 
+	jobs := make(chan *auth.Account)
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for acc := range jobs {
+				testCtx, cancel := context.WithTimeout(context.Background(), batchTestTimeout)
+				proxyOverride := h.store.ResolveMaintenanceProxy(testCtx, acc)
+				resp, err := executeRequest(testCtx, acc, payload, "", proxyOverride, "", nil, nil)
+				cancel()
+				if err != nil {
+					atomic.AddInt64(&failedCount, 1)
+					continue
+				}
+				func() {
+					defer resp.Body.Close()
+					_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBatchDrainBytes))
+
+					switch resp.StatusCode {
+					case http.StatusOK:
+						usagePct, hasUsage := proxy.ParseCodexUsageHeaders(resp, acc)
+						if hasUsage {
+							h.store.PersistUsageSnapshot(acc, usagePct)
+						}
+						if !hasUsage || usagePct < 100 {
+							h.store.ClearCooldown(acc)
+						}
+						atomic.AddInt64(&successCount, 1)
+					case http.StatusUnauthorized:
+						if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, acc); ok {
+							h.store.PersistUsageSnapshot(acc, usagePct)
+						}
+						h.store.MarkCooldown(acc, 24*time.Hour, "unauthorized")
+						atomic.AddInt64(&bannedCount, 1)
+					case http.StatusTooManyRequests:
+						if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, acc); ok {
+							h.store.PersistUsageSnapshot(acc, usagePct)
+						}
+						h.store.MarkCooldown(acc, 5*time.Minute, "rate_limited")
+						atomic.AddInt64(&rateLimitCount, 1)
+					default:
+						atomic.AddInt64(&failedCount, 1)
+					}
+				}()
+			}
+		}()
+	}
+
 	for _, account := range accounts {
-		// 跳过没有 token 的账号
 		account.Mu().RLock()
 		hasToken := account.AccessToken != ""
 		account.Mu().RUnlock()
@@ -216,51 +312,10 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			atomic.AddInt64(&failedCount, 1)
 			continue
 		}
-
-		wg.Add(1)
-		go func(acc *auth.Account) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			proxyOverride := h.store.EffectiveProxyURL(acc)
-			resp, err := executeRequest(context.Background(), acc, payload, "", proxyOverride, "", nil, nil)
-			if err != nil {
-				atomic.AddInt64(&failedCount, 1)
-				return
-			}
-			defer resp.Body.Close()
-			io.ReadAll(resp.Body) // 消费 body
-
-			switch resp.StatusCode {
-			case http.StatusOK:
-				usagePct, hasUsage := proxy.ParseCodexUsageHeaders(resp, acc)
-				if hasUsage {
-					h.store.PersistUsageSnapshot(acc, usagePct)
-				}
-				// 只有用量未耗尽时才重置状态，避免把 100% 用量的账号放回可调度池
-				if !hasUsage || usagePct < 100 {
-					h.store.ClearCooldown(acc)
-				}
-				atomic.AddInt64(&successCount, 1)
-			case http.StatusUnauthorized:
-				if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, acc); ok {
-					h.store.PersistUsageSnapshot(acc, usagePct)
-				}
-				h.store.MarkCooldown(acc, 24*time.Hour, "unauthorized")
-				atomic.AddInt64(&bannedCount, 1)
-			case http.StatusTooManyRequests:
-				if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, acc); ok {
-					h.store.PersistUsageSnapshot(acc, usagePct)
-				}
-				h.store.MarkCooldown(acc, 5*time.Minute, "rate_limited")
-				atomic.AddInt64(&rateLimitCount, 1)
-			default:
-				atomic.AddInt64(&failedCount, 1)
-			}
-		}(account)
+		jobs <- account
 	}
 
+	close(jobs)
 	wg.Wait()
 
 	c.JSON(http.StatusOK, gin.H{

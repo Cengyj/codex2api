@@ -145,7 +145,6 @@ func TestIsSensitiveEndpoint(t *testing.T) {
 		expected bool
 	}{
 		{"/api/admin/accounts", true},
-		{"/api/admin/keys", true},
 		{"/api/admin/settings", true},
 		{"/api/admin/proxies", true},
 		{"/api/admin/stats", false},

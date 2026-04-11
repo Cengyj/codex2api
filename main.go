@@ -61,15 +61,27 @@ func main() {
 		// 初次运行，保存初始安全设置到数据库
 		log.Printf("初次运行，初始化系统默认设置...")
 		settings = &database.SystemSettings{
-			MaxConcurrency:        2,
-			GlobalRPM:             0,
-			TestModel:             "gpt-5.4",
-			TestConcurrency:       50,
-			ProxyURL:              "",
-			PgMaxConns:            50,
-			RedisPoolSize:         30,
-			AutoCleanUnauthorized: false,
-			AutoCleanRateLimited:  false,
+			MaxConcurrency:                  2,
+			GlobalRPM:                       0,
+			TestModel:                       "gpt-5.4",
+			TestConcurrency:                 50,
+			ProxyURL:                        "",
+			PgMaxConns:                      50,
+			RedisPoolSize:                   30,
+			AutoCleanUnauthorized:           false,
+			AutoCleanRateLimited:            false,
+			RefreshScanEnabled:              true,
+			RefreshScanIntervalSeconds:      120,
+			RefreshPreExpireSeconds:         300,
+			RefreshMaxConcurrency:           10,
+			RefreshOnImportEnabled:          true,
+			RefreshOnImportConcurrency:      10,
+			UsageProbeEnabled:               true,
+			UsageProbeStaleAfterSeconds:     600,
+			UsageProbeMaxConcurrency:        4,
+			RecoveryProbeEnabled:            true,
+			RecoveryProbeMinIntervalSeconds: 1800,
+			RecoveryProbeMaxConcurrency:     2,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -77,10 +89,13 @@ func main() {
 		settings = &database.SystemSettings{MaxConcurrency: 2, GlobalRPM: 0, TestModel: "gpt-5.4", TestConcurrency: 50, PgMaxConns: 50, RedisPoolSize: 30}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
-			settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
+			security.SanitizeLog(settings.ProxyURL), settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
+	}
+	if strings.TrimSpace(cfg.AdminSecret) == "" && (settings == nil || strings.TrimSpace(settings.AdminSecret) == "") {
+		log.Fatal("ADMIN_SECRET ??????????????????????????")
 	}
 
-	// 4. 初始化缓存（使用数据库中保存的连接池大小）
+	// 4. ?????????????????????
 	redisPoolSize := 30
 	if settings.RedisPoolSize > 0 {
 		redisPoolSize = settings.RedisPoolSize
@@ -154,10 +169,6 @@ func main() {
 
 	// handler 不再接收 cfg.APIKeys
 	// 从环境变量读取设备指纹配置（后续可从数据库配置）
-	deviceCfg := &proxy.DeviceProfileConfig{
-		StabilizeDeviceProfile: os.Getenv("STABILIZE_DEVICE_PROFILE") == "true",
-	}
-	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
@@ -168,7 +179,6 @@ func main() {
 	}
 	log.Printf("单账号并发上限: %d", settings.MaxConcurrency)
 
-	handler.RegisterRoutes(r)
 	adminHandler.RegisterRoutes(r)
 
 	// 管理后台前端静态文件
@@ -222,10 +232,6 @@ func main() {
 	log.Printf("  Codex2API v2 已启动")
 	log.Printf("  HTTP:   http://0.0.0.0%s", addr)
 	log.Printf("  管理台: http://0.0.0.0%s/admin/", addr)
-	log.Printf("  API:    POST /v1/chat/completions")
-	log.Printf("  API:    POST /v1/responses")
-	log.Printf("  API:    POST /v1/messages")
-	log.Printf("  API:    GET  /v1/models")
 	log.Println("==========================================")
 
 	// 优雅关闭

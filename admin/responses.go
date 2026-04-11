@@ -1,11 +1,9 @@
 package admin
 
 import (
+	"log"
 	"net/http"
-	"time"
 
-	"github.com/codex2api/database"
-	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
 
@@ -18,14 +16,16 @@ type messageResponse struct {
 }
 
 type statsResponse struct {
-	Total         int   `json:"total"`
-	Available     int   `json:"available"`
-	Error         int   `json:"error"`
-	TodayRequests int64 `json:"today_requests"`
+	Total            int                   `json:"total"`
+	Available        int                   `json:"available"`
+	Error            int                   `json:"error"`
+	RefreshScheduler refreshStatusResponse `json:"refresh_scheduler"`
+	RefreshConfig    refreshConfigResponse `json:"refresh_config"`
 }
 
 type accountsResponse struct {
-	Accounts []accountResponse `json:"accounts"`
+	Accounts         []accountResponse     `json:"accounts"`
+	RefreshScheduler refreshStatusResponse `json:"refresh_scheduler"`
 }
 
 type createAccountResponse struct {
@@ -34,43 +34,28 @@ type createAccountResponse struct {
 }
 
 type healthResponse struct {
-	Status    string `json:"status"`
-	Available int    `json:"available"`
-	Total     int    `json:"total"`
+	Status           string                `json:"status"`
+	Available        int                   `json:"available"`
+	Total            int                   `json:"total"`
+	RefreshScheduler refreshStatusResponse `json:"refresh_scheduler"`
 }
 
-type usageLogsResponse struct {
-	Logs []*database.UsageLog `json:"logs"`
+type refreshStatusResponse struct {
+	Running        bool   `json:"running"`
+	TotalAccounts  int    `json:"total_accounts"`
+	TargetAccounts int    `json:"target_accounts"`
+	Processed      int    `json:"processed"`
+	Success        int    `json:"success"`
+	Failure        int    `json:"failure"`
+	NextScanAt     string `json:"next_scan_at,omitempty"`
+	StartedAt      string `json:"started_at,omitempty"`
+	FinishedAt     string `json:"finished_at,omitempty"`
 }
 
-type apiKeysResponse struct {
-	Keys []*MaskedAPIKeyRow `json:"keys"`
-}
-
-// MaskedAPIKeyRow API Key 响应（含脱敏和完整 key）
-type MaskedAPIKeyRow struct {
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	Key       string `json:"key"`
-	RawKey    string `json:"raw_key"`
-	CreatedAt string `json:"created_at"`
-}
-
-// NewMaskedAPIKeyRow 创建 API Key 响应
-func NewMaskedAPIKeyRow(row *database.APIKeyRow) *MaskedAPIKeyRow {
-	return &MaskedAPIKeyRow{
-		ID:        row.ID,
-		Name:      row.Name,
-		Key:       security.MaskAPIKey(row.Key),
-		RawKey:    row.Key,
-		CreatedAt: row.CreatedAt.Format(time.RFC3339),
-	}
-}
-
-type createAPIKeyResponse struct {
-	ID   int64  `json:"id"`
-	Key  string `json:"key"`
-	Name string `json:"name"`
+type refreshConfigResponse struct {
+	ScanEnabled         bool `json:"scan_enabled"`
+	ScanIntervalSeconds int  `json:"scan_interval_seconds"`
+	PreExpireSeconds    int  `json:"pre_expire_seconds"`
 }
 
 type opsOverviewResponse struct {
@@ -83,10 +68,8 @@ type opsOverviewResponse struct {
 	CPU            opsCPUResponse      `json:"cpu"`
 	Memory         opsMemoryResponse   `json:"memory"`
 	Runtime        opsRuntimeResponse  `json:"runtime"`
-	Requests       opsRequestsResponse `json:"requests"`
 	Postgres       opsDatabaseResponse `json:"postgres"`
 	Redis          opsRedisResponse    `json:"redis"`
-	Traffic        opsTrafficResponse  `json:"traffic"`
 }
 
 type opsCPUResponse struct {
@@ -105,11 +88,6 @@ type opsRuntimeResponse struct {
 	Goroutines        int `json:"goroutines"`
 	AvailableAccounts int `json:"available_accounts"`
 	TotalAccounts     int `json:"total_accounts"`
-}
-
-type opsRequestsResponse struct {
-	Active int64 `json:"active"`
-	Total  int64 `json:"total"`
 }
 
 type opsDatabaseResponse struct {
@@ -131,19 +109,6 @@ type opsRedisResponse struct {
 	UsagePercent float64 `json:"usage_percent"`
 }
 
-type opsTrafficResponse struct {
-	QPS           float64 `json:"qps"`
-	QPSPeak       float64 `json:"qps_peak"`
-	TPS           float64 `json:"tps"`
-	TPSPeak       float64 `json:"tps_peak"`
-	RPM           float64 `json:"rpm"`
-	TPM           float64 `json:"tpm"`
-	ErrorRate     float64 `json:"error_rate"`
-	TodayRequests int64   `json:"today_requests"`
-	TodayTokens   int64   `json:"today_tokens"`
-	RPMLimit      int     `json:"rpm_limit"`
-}
-
 func writeError(c *gin.Context, statusCode int, message string) {
 	c.JSON(statusCode, errorResponse{Error: message})
 }
@@ -154,4 +119,11 @@ func writeMessage(c *gin.Context, statusCode int, message string) {
 
 func writeInternalError(c *gin.Context, err error) {
 	writeError(c, http.StatusInternalServerError, err.Error())
+}
+
+func writeLoggedInternalError(c *gin.Context, publicMessage string, err error) {
+	if err != nil {
+		log.Printf("[admin] %s: %v", publicMessage, err)
+	}
+	writeError(c, http.StatusInternalServerError, publicMessage)
 }
