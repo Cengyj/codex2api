@@ -76,7 +76,7 @@ type Account struct {
 	ProxyLastError        string
 	Status                AccountStatus
 	CooldownUtil          time.Time
-	CooldownReason        string // rate_limited / unauthorized / ??
+	CooldownReason        string // rate_limited / unauthorized / other
 	ErrorMsg              string
 
 	// 用量进度（从 Codex 响应头被动解析）
@@ -889,7 +889,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	atomic.StoreInt64(&s.recoveryProbeMaxConcurrency, int64(normalizeRecoveryProbeMaxConcurrency(settings.RecoveryProbeMaxConcurrency)))
 	retries := int64(settings.MaxRetries)
 	if retries <= 0 {
-		retries = 2 // ?????? 2 ??
+		retries = 2 // 默认重试 2 次
 	}
 	atomic.StoreInt64(&s.maxRetries, retries)
 	s.allowRemoteMigration.Store(settings.AllowRemoteMigration)

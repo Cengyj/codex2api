@@ -573,7 +573,7 @@ type SystemSettings struct {
 	MihomoDelayTimeoutMs            int
 }
 
-// GetSystemSettings ?????????
+// GetSystemSettings 获取系统设置
 func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s := &SystemSettings{}
 	err := db.conn.QueryRowContext(ctx, `
@@ -639,7 +639,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	return s, err
 }
 
-// UpdateSystemSettings ???????????psert??????????????
+// UpdateSystemSettings 更新系统设置，使用 upsert 保证单行配置存在
 func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error {
 	_, err := db.conn.ExecContext(ctx, `
 		INSERT INTO system_settings (

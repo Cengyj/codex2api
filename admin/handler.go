@@ -153,7 +153,7 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 			// 未配置管理密钥，跳过鉴权
 			security.SecurityAuditLog("ADMIN_AUTH_MISCONFIGURED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
 			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": "????????????????",
+				"error": "管理员密钥未配置",
 			})
 			c.Abort()
 			return
@@ -787,7 +787,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		return
 	}
 
-	// ???????????
+	// 支持逐行粘贴多个 Access Token
 	lines := strings.Split(req.AccessToken, "\n")
 	var tokens []string
 	for _, line := range lines {
@@ -2054,9 +2054,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
 			currentAdminSecret = *req.AdminSecret
-			log.Printf("?????: admin_secret (??=%d)", len(currentAdminSecret))
+			log.Printf("更新设置: admin_secret (length=%d)", len(currentAdminSecret))
 		} else {
-			log.Printf("??????? ADMIN_SECRET???????? admin_secret")
+			log.Printf("已忽略 admin_secret 更新：ADMIN_SECRET 环境变量优先")
 		}
 	}
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
@@ -2223,7 +2223,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			v = 50
 		}
 		h.store.SetMaxConcurrency(v)
-		log.Printf("?????: max_concurrency = %d", v)
+		log.Printf("更新设置: max_concurrency = %d", v)
 	}
 
 	if req.GlobalRPM != nil {
@@ -2232,12 +2232,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			v = 0
 		}
 		h.rateLimiter.UpdateRPM(v)
-		log.Printf("?????: global_rpm = %d", v)
+		log.Printf("更新设置: global_rpm = %d", v)
 	}
 
 	if req.TestModel != nil && *req.TestModel != "" {
 		h.store.SetTestModel(*req.TestModel)
-		log.Printf("?????: test_model = %s", *req.TestModel)
+		log.Printf("更新设置: test_model = %s", *req.TestModel)
 	}
 
 	if req.TestConcurrency != nil {
@@ -2249,13 +2249,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			v = 200
 		}
 		h.store.SetTestConcurrency(v)
-		log.Printf("?????: test_concurrency = %d", v)
+		log.Printf("更新设置: test_concurrency = %d", v)
 	}
 
 	if req.ProxyURL != nil || req.ProxyDefaultMode != nil || req.ProxyDynamicProviderURL != nil || req.ProxyDefaultProtocol != nil || req.ProxyPoolEnabled != nil {
 		if req.ProxyURL != nil {
 			h.store.SetProxyURL(pendingProxyConfig.URL)
-			log.Printf("?????: proxy_url = %s", security.SanitizeLog(pendingProxyConfig.URL))
+			log.Printf("更新设置: proxy_url = %s", security.SanitizeLog(pendingProxyConfig.URL))
 		}
 		h.store.SetProxyMode(pendingProxyConfig.Mode)
 		if req.ProxyDynamicProviderURL != nil {
@@ -2287,7 +2287,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		h.db.SetMaxOpenConns(v)
 		h.pgMaxConns = v
-		log.Printf("?????: pg_max_conns = %d", v)
+		log.Printf("更新设置: pg_max_conns = %d", v)
 	}
 
 	if req.RedisPoolSize != nil {
@@ -2300,40 +2300,40 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		h.cache.SetPoolSize(v)
 		h.redisPoolSize = v
-		log.Printf("?????: redis_pool_size = %d", v)
+		log.Printf("更新设置: redis_pool_size = %d", v)
 	}
 
 	if req.AutoCleanUnauthorized != nil {
 		h.store.SetAutoCleanUnauthorized(*req.AutoCleanUnauthorized)
-		log.Printf("?????: auto_clean_unauthorized = %t", *req.AutoCleanUnauthorized)
+		log.Printf("更新设置: auto_clean_unauthorized = %t", *req.AutoCleanUnauthorized)
 	}
 
 	if req.AutoCleanRateLimited != nil {
 		h.store.SetAutoCleanRateLimited(*req.AutoCleanRateLimited)
-		log.Printf("?????: auto_clean_rate_limited = %t", *req.AutoCleanRateLimited)
+		log.Printf("更新设置: auto_clean_rate_limited = %t", *req.AutoCleanRateLimited)
 	}
 
 	if req.AutoCleanFullUsage != nil {
 		h.store.SetAutoCleanFullUsage(*req.AutoCleanFullUsage)
-		log.Printf("?????: auto_clean_full_usage = %t", *req.AutoCleanFullUsage)
+		log.Printf("更新设置: auto_clean_full_usage = %t", *req.AutoCleanFullUsage)
 	}
 
 	if req.AutoCleanError != nil {
 		h.store.SetAutoCleanError(*req.AutoCleanError)
-		log.Printf("?????: auto_clean_error = %t", *req.AutoCleanError)
+		log.Printf("更新设置: auto_clean_error = %t", *req.AutoCleanError)
 	}
 
 	var expiredCleaned int
 	if req.AutoCleanExpired != nil {
 		h.store.SetAutoCleanExpired(*req.AutoCleanExpired)
-		log.Printf("?????: auto_clean_expired = %t", *req.AutoCleanExpired)
+		log.Printf("更新设置: auto_clean_expired = %t", *req.AutoCleanExpired)
 		expiredCleanRequested = *req.AutoCleanExpired
 	}
 
 	if req.ProxyPoolEnabled != nil {
 		h.store.SetProxyPoolEnabled(*req.ProxyPoolEnabled)
 		proxyPoolReloadNeeded = *req.ProxyPoolEnabled
-		log.Printf("?????: proxy_pool_enabled = %t", *req.ProxyPoolEnabled)
+		log.Printf("更新设置: proxy_pool_enabled = %t", *req.ProxyPoolEnabled)
 	}
 
 	if req.MaxRetries != nil {
@@ -2345,7 +2345,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			v = 10
 		}
 		h.store.SetMaxRetries(v)
-		log.Printf("?????: max_retries = %d", v)
+		log.Printf("更新设置: max_retries = %d", v)
 	}
 
 	if req.RefreshScanEnabled != nil {
@@ -2387,7 +2387,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 
 	if req.AllowRemoteMigration != nil {
 		h.store.SetAllowRemoteMigration(*req.AllowRemoteMigration)
-		log.Printf("?????: allow_remote_migration = %t", *req.AllowRemoteMigration)
+		log.Printf("更新设置: allow_remote_migration = %t", *req.AllowRemoteMigration)
 	} else if !hasAdminSecret {
 		h.store.SetAllowRemoteMigration(false)
 	}
@@ -2532,7 +2532,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	err = h.db.UpdateSystemSettings(c.Request.Context(), persistedSettings)
 	if err != nil {
 		h.restoreRuntimeSettingsSnapshot(runtimeSnapshot)
-		log.Printf("?????????: %v", err)
+		log.Printf("保存系统设置失败: %v", err)
 		writeError(c, http.StatusServiceUnavailable, "保存系统设置失败")
 		return
 	}
@@ -2540,7 +2540,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	effectiveSettings := *persistedSettings
 	appliedEnvOverrides := config.ApplySystemSettingsEnvOverrides(&effectiveSettings)
 	if len(appliedEnvOverrides) > 0 {
-		log.Printf("???????? .env ??????: %s", strings.Join(appliedEnvOverrides, ", "))
+		log.Printf("重新应用 .env 运行时覆盖: %s", strings.Join(appliedEnvOverrides, ", "))
 	}
 	h.applySystemSettingsToRuntime(&effectiveSettings)
 

@@ -95,10 +95,10 @@ func main() {
 		log.Printf("宸插簲鐢? .env 杩愯閰嶇疆瑕嗙洊: %s", strings.Join(appliedOverrides, ", "))
 	}
 	if strings.TrimSpace(cfg.AdminSecret) == "" && (settings == nil || strings.TrimSpace(settings.AdminSecret) == "") {
-		log.Fatal("ADMIN_SECRET ??????????????????????????")
+		log.Fatal("ADMIN_SECRET 未配置：请在 .env 或系统设置中配置管理员密钥")
 	}
 
-	// 4. ?????????????????????
+	// 4. 初始化缓存
 	redisPoolSize := 30
 	if settings.RedisPoolSize > 0 {
 		redisPoolSize = settings.RedisPoolSize

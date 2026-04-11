@@ -227,7 +227,7 @@ func TestAddATAccountReturnsReadableProxyConfigValidationError(t *testing.T) {
 	if !strings.Contains(got, "代理配置无效") {
 		t.Fatalf("error = %q, want prefix containing %q", got, "代理配置无效")
 	}
-	if strings.Contains(got, "??????") {
+	if strings.Contains(got, "placeholder") {
 		t.Fatalf("error = %q, should not contain placeholder text", got)
 	}
 }
