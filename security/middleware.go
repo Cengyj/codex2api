@@ -24,7 +24,18 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
 
 		// Content Security Policy
-		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self';")
+		// 管理前端当前依赖：
+		// - /admin/assets/* 静态资源
+		// - Google Fonts 样式与字体
+		// - index.html 中的内联主题初始化脚本
+		c.Header("Content-Security-Policy", strings.Join([]string{
+			"default-src 'self'",
+			"script-src 'self' 'unsafe-inline'",
+			"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+			"font-src 'self' data: https://fonts.gstatic.com",
+			"img-src 'self' data:",
+			"connect-src 'self'",
+		}, "; ")+";")
 
 		// Strict Transport Security (HTTPS only)
 		// c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")

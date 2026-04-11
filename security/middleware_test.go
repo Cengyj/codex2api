@@ -35,6 +35,21 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 			t.Errorf("Header %s = %q, expected %q", header, value, expected)
 		}
 	}
+
+	csp := w.Header().Get("Content-Security-Policy")
+	expectedFragments := []string{
+		"default-src 'self'",
+		"script-src 'self' 'unsafe-inline'",
+		"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+		"font-src 'self' data: https://fonts.gstatic.com",
+		"img-src 'self' data:",
+		"connect-src 'self'",
+	}
+	for _, fragment := range expectedFragments {
+		if !strings.Contains(csp, fragment) {
+			t.Errorf("Content-Security-Policy missing %q in %q", fragment, csp)
+		}
+	}
 }
 
 func TestRateLimitMiddleware(t *testing.T) {
