@@ -320,3 +320,48 @@ curl -H "X-Admin-Key: your-secret" http://localhost:8080/api/admin/ops/overview
 - `DATABASE_HOST is empty` - 未配置数据库主机
 - `REDIS_ADDR is empty` - Redis 模式下未配置 Redis 地址
 - `DATABASE_PATH is empty` - SQLite 模式下未配置数据路径
+
+## 2026-04-11 配置优先级补充（方案 2）
+
+- 当前采用“**.env / 环境变量优先，数据库 system_settings 仅作 fallback**”的运行策略。
+- 启动时：物理层配置（端口、数据库、缓存、`ADMIN_SECRET`）仍直接从 `.env` / 环境变量读取。
+- 运行时：已纳入覆盖范围的系统设置会先读取数据库，再叠加 `.env` 覆盖，最终以内存中的有效值运行。
+- 管理后台保存设置后：
+  - 数据库继续保存后台提交的值，作为 fallback；
+  - 如果对应 env 已设置，运行时会立即重新应用 env 值；
+  - 未在本次请求中修改的 env 受控字段，不会再被错误写回数据库 fallback。
+- 因此，管理后台展示的是**当前生效值**；数据库保存的是**env 缺失时的回退值**。
+
+### 当前已支持 env 覆盖的常用运行时字段
+
+- `MAX_CONCURRENCY`
+- `GLOBAL_RPM`
+- `TEST_MODEL`
+- `TEST_CONCURRENCY`
+- `CODEX_PROXY_URL` / `PROXY_URL`
+- `PROXY_DEFAULT_MODE`
+- `PROXY_DYNAMIC_PROVIDER_URL`
+- `PROXY_DEFAULT_PROTOCOL`
+- `PROXY_ROTATION_HOURS`
+- `PG_MAX_CONNS`
+- `REDIS_POOL_SIZE`
+- `AUTO_CLEAN_UNAUTHORIZED`
+- `AUTO_CLEAN_RATE_LIMITED`
+- `AUTO_CLEAN_FULL_USAGE`
+- `AUTO_CLEAN_ERROR`
+- `AUTO_CLEAN_EXPIRED`
+- `PROXY_POOL_ENABLED`
+- `MAX_RETRIES`
+- `REFRESH_SCAN_ENABLED`
+- `REFRESH_SCAN_INTERVAL_SECONDS`
+- `REFRESH_PRE_EXPIRE_SECONDS`
+- `REFRESH_MAX_CONCURRENCY`
+- `REFRESH_ON_IMPORT_ENABLED`
+- `REFRESH_ON_IMPORT_CONCURRENCY`
+- `USAGE_PROBE_ENABLED`
+- `USAGE_PROBE_STALE_AFTER_SECONDS`
+- `USAGE_PROBE_MAX_CONCURRENCY`
+- `RECOVERY_PROBE_ENABLED`
+- `RECOVERY_PROBE_MIN_INTERVAL_SECONDS`
+- `RECOVERY_PROBE_MAX_CONCURRENCY`
+- `ALLOW_REMOTE_MIGRATION`

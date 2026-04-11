@@ -312,3 +312,44 @@
 ### 下一轮重点或停止理由
 - 建议停止：截至本轮，已完成多轮完整审查；P0 已清零；高价值 P1 已处理；关键路径和退出路径均已验证。
 - 只有当部署形态变化（例如多人使用、公开管理后台、反向代理/跨域接入）时，才建议重新升级前端暴露类议题并再开新一轮审查。
+
+## Round 6（2026-04-11，配置文件优先 / 方案 2）
+
+### 本轮重新加载
+- 代码文件：`main.go`、`config/system_settings_env.go`、`config/system_settings_env_test.go`、`admin/handler.go`、`admin/handler_test.go`
+- 规范文件章节：`docs/CONFIGURATION.md`、`docs/DEPLOYMENT.md`、`docs/subsystem-skill-standards.md` 中后端配置与部署相关章节
+- 原始 skills：`golang-patterns`、`golang-testing`
+
+### 本轮发现的问题及分级
+- **P1**：运行时已支持 `.env` 覆盖 `system_settings`，但管理后台保存任意其他字段时，会把数据库中的 env 受控字段 fallback 一并覆盖成当前运行值，导致 fallback 被污染。
+- **P2**：部署文档仍把 `docker compose pull` 写成默认更新路径，容易让源码已更新但容器内 UI 仍是旧版本。
+
+### 本轮修复
+- 新增 `config.ApplySystemSettingsEnvOverrides()`，让已支持的运行时系统设置优先读取 `.env` / 环境变量。
+- 在 `main.go` 启动阶段加载数据库设置后重新应用 env 覆盖，并记录生效项。
+- 在 `admin/handler.go` 中保存设置后重新应用 env 覆盖到运行时，使“数据库保存 fallback，运行时仍以 env 为准”成立。
+- 修复数据库 fallback 污染问题：未在本次请求中提交的 env 受控字段，不再被错误写回数据库。
+- 更新 `.env.example` / `.env.sqlite.example`，补充常用运行时 env 覆盖示例。
+- 更新部署文档，明确“拉源码后必须本地 build 才会更新前端 UI”，并补充外部 1Panel 网络接入示例。
+
+### 本轮验证
+- `go test ./config ./admin ./security -count=1` ✅
+- `go test ./... -count=1` ✅
+- 新增测试覆盖：
+  - env 覆盖运行时设置
+  - 允许通过空 env 清空数据库中的代理地址
+  - 保存设置后重新应用 env 覆盖
+  - 保存其他字段时不污染数据库 fallback
+
+### 为什么这些改动没有新增功能，也没有删减当前仍在使用的功能
+- 没有新增用户入口、隐藏入口、调试开关或额外运行时能力。
+- `/admin/`、`/health`、`/api/admin/*` 保持不变。
+- 只是把原本分裂的“数据库配置 vs `.env` 配置”优先级明确化，并修正保存路径中的状态污染问题。
+
+### 当前剩余风险
+- 当前 env 覆盖只覆盖已明确纳入的运行时系统参数；更偏后台集成性质的 CPA / Mihomo 配置仍主要以数据库为准。
+- 服务器侧若继续使用外部 1Panel PostgreSQL / Redis，仍必须保证 `codex2api` 容器加入正确外部网络，否则 `.env` 正确也会因 Docker DNS 不通而启动失败。
+
+### 下一轮重点或停止理由
+- 本轮目标“默认优先读取配置文件（方案 2）”已落地，且关键 Go 回归测试已通过。
+- 若无新的部署异常，建议停止本轮。

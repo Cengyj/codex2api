@@ -21,6 +21,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
+	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
@@ -1909,6 +1910,52 @@ func (h *Handler) restoreRuntimeSettingsSnapshot(snapshot runtimeSettingsSnapsho
 	h.store.SetAllowRemoteMigration(snapshot.allowRemoteMigration)
 }
 
+func (h *Handler) applySystemSettingsToRuntime(settings *database.SystemSettings) {
+	if h == nil || settings == nil {
+		return
+	}
+
+	h.store.SetMaxConcurrency(settings.MaxConcurrency)
+	h.rateLimiter.UpdateRPM(settings.GlobalRPM)
+	h.store.SetTestModel(settings.TestModel)
+	h.store.SetTestConcurrency(settings.TestConcurrency)
+	h.store.SetProxyURL(settings.ProxyURL)
+	h.store.SetProxyMode(settings.ProxyMode)
+	h.store.SetProxyProviderURL(settings.ProxyProviderURL)
+	h.store.SetProxySchemeDefault(settings.ProxySchemeDefault)
+	h.store.SetProxyRotationHours(settings.ProxyRotationHours)
+
+	if settings.PgMaxConns > 0 {
+		h.db.SetMaxOpenConns(settings.PgMaxConns)
+		h.pgMaxConns = settings.PgMaxConns
+	}
+	if settings.RedisPoolSize > 0 {
+		h.cache.SetPoolSize(settings.RedisPoolSize)
+		h.redisPoolSize = settings.RedisPoolSize
+	}
+
+	h.store.SetAutoCleanUnauthorized(settings.AutoCleanUnauthorized)
+	h.store.SetAutoCleanRateLimited(settings.AutoCleanRateLimited)
+	h.store.SetAutoCleanFullUsage(settings.AutoCleanFullUsage)
+	h.store.SetAutoCleanError(settings.AutoCleanError)
+	h.store.SetAutoCleanExpired(settings.AutoCleanExpired)
+	h.store.SetProxyPoolEnabled(settings.ProxyPoolEnabled)
+	h.store.SetMaxRetries(settings.MaxRetries)
+	h.store.SetRefreshScanEnabled(settings.RefreshScanEnabled)
+	h.store.SetRefreshScanInterval(time.Duration(settings.RefreshScanIntervalSeconds) * time.Second)
+	h.store.SetRefreshPreExpireWindow(time.Duration(settings.RefreshPreExpireSeconds) * time.Second)
+	h.store.SetRefreshMaxConcurrency(settings.RefreshMaxConcurrency)
+	h.store.SetRefreshOnImportEnabled(settings.RefreshOnImportEnabled)
+	h.store.SetRefreshOnImportConcurrency(settings.RefreshOnImportConcurrency)
+	h.store.SetUsageProbeEnabled(settings.UsageProbeEnabled)
+	h.store.SetUsageProbeStaleAfter(time.Duration(settings.UsageProbeStaleAfterSeconds) * time.Second)
+	h.store.SetUsageProbeMaxConcurrency(settings.UsageProbeMaxConcurrency)
+	h.store.SetRecoveryProbeEnabled(settings.RecoveryProbeEnabled)
+	h.store.SetRecoveryProbeMinInterval(time.Duration(settings.RecoveryProbeMinIntervalSeconds) * time.Second)
+	h.store.SetRecoveryProbeMaxConcurrency(settings.RecoveryProbeMaxConcurrency)
+	h.store.SetAllowRemoteMigration(settings.AllowRemoteMigration)
+}
+
 // GetSettings 获取当前系统设置
 func (h *Handler) GetSettings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
@@ -2345,40 +2392,44 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetAllowRemoteMigration(false)
 	}
 
-	err = h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
-		MaxConcurrency:                  h.store.GetMaxConcurrency(),
-		GlobalRPM:                       h.rateLimiter.GetRPM(),
-		TestModel:                       h.store.GetTestModel(),
-		TestConcurrency:                 h.store.GetTestConcurrency(),
-		ProxyURL:                        h.store.GetProxyURL(),
-		ProxyMode:                       h.store.GetProxyMode(),
-		ProxyProviderURL:                h.store.GetProxyProviderURL(),
-		ProxySchemeDefault:              h.store.GetProxySchemeDefault(),
-		ProxyRotationHours:              h.store.GetProxyRotationHours(),
-		PgMaxConns:                      h.pgMaxConns,
-		RedisPoolSize:                   h.redisPoolSize,
-		AutoCleanUnauthorized:           h.store.GetAutoCleanUnauthorized(),
-		AutoCleanRateLimited:            h.store.GetAutoCleanRateLimited(),
+	persistedSettings := &database.SystemSettings{
+		MaxConcurrency:                  existingSettings.MaxConcurrency,
+		GlobalRPM:                       existingSettings.GlobalRPM,
+		TestModel:                       existingSettings.TestModel,
+		TestConcurrency:                 existingSettings.TestConcurrency,
+		ProxyURL:                        existingSettings.ProxyURL,
+		ProxyMode:                       existingSettings.ProxyMode,
+		ProxyProviderURL:                existingSettings.ProxyProviderURL,
+		ProxySchemeDefault:              existingSettings.ProxySchemeDefault,
+		AutoAssignProxyIfMissing:        existingSettings.AutoAssignProxyIfMissing,
+		SwitchProxyOnNetworkError:       existingSettings.SwitchProxyOnNetworkError,
+		ProxyRotationHours:              existingSettings.ProxyRotationHours,
+		DisableProxyDuringImport:        existingSettings.DisableProxyDuringImport,
+		PgMaxConns:                      existingSettings.PgMaxConns,
+		RedisPoolSize:                   existingSettings.RedisPoolSize,
+		AutoCleanUnauthorized:           existingSettings.AutoCleanUnauthorized,
+		AutoCleanRateLimited:            existingSettings.AutoCleanRateLimited,
 		AdminSecret:                     currentAdminSecret,
-		AutoCleanFullUsage:              h.store.GetAutoCleanFullUsage(),
-		AutoCleanError:                  h.store.GetAutoCleanError(),
-		AutoCleanExpired:                h.store.GetAutoCleanExpired(),
-		ProxyPoolEnabled:                h.store.GetProxyPoolEnabled(),
-		MaxRetries:                      h.store.GetMaxRetries(),
-		RefreshScanEnabled:              h.store.GetRefreshScanEnabled(),
-		RefreshScanIntervalSeconds:      int(h.store.GetRefreshScanInterval().Seconds()),
-		RefreshPreExpireSeconds:         int(h.store.GetRefreshPreExpireWindow().Seconds()),
-		RefreshMaxConcurrency:           h.store.GetRefreshMaxConcurrency(),
-		RefreshOnImportEnabled:          h.store.GetRefreshOnImportEnabled(),
-		RefreshOnImportConcurrency:      h.store.GetRefreshOnImportConcurrency(),
-		UsageProbeEnabled:               h.store.GetUsageProbeEnabled(),
-		UsageProbeStaleAfterSeconds:     int(h.store.GetUsageProbeStaleAfter().Seconds()),
-		UsageProbeMaxConcurrency:        h.store.GetUsageProbeMaxConcurrency(),
-		RecoveryProbeEnabled:            h.store.GetRecoveryProbeEnabled(),
-		RecoveryProbeMinIntervalSeconds: int(h.store.GetRecoveryProbeMinInterval().Seconds()),
-		RecoveryProbeMaxConcurrency:     h.store.GetRecoveryProbeMaxConcurrency(),
+		AutoCleanFullUsage:              existingSettings.AutoCleanFullUsage,
+		AutoCleanError:                  existingSettings.AutoCleanError,
+		AutoCleanExpired:                existingSettings.AutoCleanExpired,
+		ProxyPoolEnabled:                existingSettings.ProxyPoolEnabled,
+		FastSchedulerEnabled:            existingSettings.FastSchedulerEnabled,
+		MaxRetries:                      existingSettings.MaxRetries,
+		RefreshScanEnabled:              existingSettings.RefreshScanEnabled,
+		RefreshScanIntervalSeconds:      existingSettings.RefreshScanIntervalSeconds,
+		RefreshPreExpireSeconds:         existingSettings.RefreshPreExpireSeconds,
+		RefreshMaxConcurrency:           existingSettings.RefreshMaxConcurrency,
+		RefreshOnImportEnabled:          existingSettings.RefreshOnImportEnabled,
+		RefreshOnImportConcurrency:      existingSettings.RefreshOnImportConcurrency,
+		UsageProbeEnabled:               existingSettings.UsageProbeEnabled,
+		UsageProbeStaleAfterSeconds:     existingSettings.UsageProbeStaleAfterSeconds,
+		UsageProbeMaxConcurrency:        existingSettings.UsageProbeMaxConcurrency,
+		RecoveryProbeEnabled:            existingSettings.RecoveryProbeEnabled,
+		RecoveryProbeMinIntervalSeconds: existingSettings.RecoveryProbeMinIntervalSeconds,
+		RecoveryProbeMaxConcurrency:     existingSettings.RecoveryProbeMaxConcurrency,
 		AllowRemoteMigration:            h.store.GetAllowRemoteMigration() && hasAdminSecret,
-		ModelMapping:                    h.store.GetModelMapping(),
+		ModelMapping:                    existingSettings.ModelMapping,
 		CPASyncEnabled:                  cpaSyncEnabled,
 		CPABaseURL:                      cpaBaseURL,
 		CPAAdminKey:                     cpaAdminKey,
@@ -2392,7 +2443,93 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		MihomoStrategyGroup:             mihomoStrategyGroup,
 		MihomoDelayTestURL:              mihomoDelayTestURL,
 		MihomoDelayTimeoutMs:            mihomoDelayTimeoutMs,
-	})
+	}
+	if req.MaxConcurrency != nil {
+		persistedSettings.MaxConcurrency = h.store.GetMaxConcurrency()
+	}
+	if req.GlobalRPM != nil {
+		persistedSettings.GlobalRPM = h.rateLimiter.GetRPM()
+	}
+	if req.TestModel != nil {
+		persistedSettings.TestModel = h.store.GetTestModel()
+	}
+	if req.TestConcurrency != nil {
+		persistedSettings.TestConcurrency = h.store.GetTestConcurrency()
+	}
+	if req.ProxyURL != nil || req.ProxyDefaultMode != nil || req.ProxyDynamicProviderURL != nil || req.ProxyDefaultProtocol != nil {
+		persistedSettings.ProxyURL = h.store.GetProxyURL()
+		persistedSettings.ProxyMode = h.store.GetProxyMode()
+		persistedSettings.ProxyProviderURL = h.store.GetProxyProviderURL()
+		persistedSettings.ProxySchemeDefault = h.store.GetProxySchemeDefault()
+	}
+	if req.ProxyRotationHours != nil {
+		persistedSettings.ProxyRotationHours = h.store.GetProxyRotationHours()
+	}
+	if req.PgMaxConns != nil {
+		persistedSettings.PgMaxConns = h.pgMaxConns
+	}
+	if req.RedisPoolSize != nil {
+		persistedSettings.RedisPoolSize = h.redisPoolSize
+	}
+	if req.AutoCleanUnauthorized != nil {
+		persistedSettings.AutoCleanUnauthorized = h.store.GetAutoCleanUnauthorized()
+	}
+	if req.AutoCleanRateLimited != nil {
+		persistedSettings.AutoCleanRateLimited = h.store.GetAutoCleanRateLimited()
+	}
+	if req.AutoCleanFullUsage != nil {
+		persistedSettings.AutoCleanFullUsage = h.store.GetAutoCleanFullUsage()
+	}
+	if req.AutoCleanError != nil {
+		persistedSettings.AutoCleanError = h.store.GetAutoCleanError()
+	}
+	if req.AutoCleanExpired != nil {
+		persistedSettings.AutoCleanExpired = h.store.GetAutoCleanExpired()
+	}
+	if req.ProxyPoolEnabled != nil {
+		persistedSettings.ProxyPoolEnabled = h.store.GetProxyPoolEnabled()
+	}
+	if req.MaxRetries != nil {
+		persistedSettings.MaxRetries = h.store.GetMaxRetries()
+	}
+	if req.RefreshScanEnabled != nil {
+		persistedSettings.RefreshScanEnabled = h.store.GetRefreshScanEnabled()
+	}
+	if req.RefreshScanIntervalSeconds != nil {
+		persistedSettings.RefreshScanIntervalSeconds = int(h.store.GetRefreshScanInterval().Seconds())
+	}
+	if req.RefreshPreExpireSeconds != nil {
+		persistedSettings.RefreshPreExpireSeconds = int(h.store.GetRefreshPreExpireWindow().Seconds())
+	}
+	if req.RefreshMaxConcurrency != nil {
+		persistedSettings.RefreshMaxConcurrency = h.store.GetRefreshMaxConcurrency()
+	}
+	if req.RefreshOnImportEnabled != nil {
+		persistedSettings.RefreshOnImportEnabled = h.store.GetRefreshOnImportEnabled()
+	}
+	if req.RefreshOnImportConcurrency != nil {
+		persistedSettings.RefreshOnImportConcurrency = h.store.GetRefreshOnImportConcurrency()
+	}
+	if req.UsageProbeEnabled != nil {
+		persistedSettings.UsageProbeEnabled = h.store.GetUsageProbeEnabled()
+	}
+	if req.UsageProbeStaleAfterSeconds != nil {
+		persistedSettings.UsageProbeStaleAfterSeconds = int(h.store.GetUsageProbeStaleAfter().Seconds())
+	}
+	if req.UsageProbeMaxConcurrency != nil {
+		persistedSettings.UsageProbeMaxConcurrency = h.store.GetUsageProbeMaxConcurrency()
+	}
+	if req.RecoveryProbeEnabled != nil {
+		persistedSettings.RecoveryProbeEnabled = h.store.GetRecoveryProbeEnabled()
+	}
+	if req.RecoveryProbeMinIntervalSeconds != nil {
+		persistedSettings.RecoveryProbeMinIntervalSeconds = int(h.store.GetRecoveryProbeMinInterval().Seconds())
+	}
+	if req.RecoveryProbeMaxConcurrency != nil {
+		persistedSettings.RecoveryProbeMaxConcurrency = h.store.GetRecoveryProbeMaxConcurrency()
+	}
+	persistedSettings.ModelMapping = h.store.GetModelMapping()
+	err = h.db.UpdateSystemSettings(c.Request.Context(), persistedSettings)
 	if err != nil {
 		h.restoreRuntimeSettingsSnapshot(runtimeSnapshot)
 		log.Printf("?????????: %v", err)
@@ -2400,10 +2537,17 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		return
 	}
 
-	if proxyPoolReloadNeeded {
+	effectiveSettings := *persistedSettings
+	appliedEnvOverrides := config.ApplySystemSettingsEnvOverrides(&effectiveSettings)
+	if len(appliedEnvOverrides) > 0 {
+		log.Printf("???????? .env ??????: %s", strings.Join(appliedEnvOverrides, ", "))
+	}
+	h.applySystemSettingsToRuntime(&effectiveSettings)
+
+	if proxyPoolReloadNeeded || effectiveSettings.ProxyPoolEnabled {
 		_ = h.store.ReloadProxyPool()
 	}
-	if expiredCleanRequested {
+	if expiredCleanRequested && effectiveSettings.AutoCleanExpired {
 		expiredCleaned = h.store.CleanExpiredNow()
 	}
 

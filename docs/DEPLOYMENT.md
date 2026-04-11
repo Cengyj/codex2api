@@ -72,3 +72,56 @@ server {
 - 账号列表可加载
 - 代理设置可保存
 - 测试连接 / 刷新状态正常
+
+## 2026-04-11 更新说明：保留旧 PostgreSQL / Redis 只更新应用容器
+
+如果你的服务器是：
+
+- 先 `git pull` 拉最新源码
+- 继续复用旧 PostgreSQL / Redis
+- 只更新 `codex2api` 应用容器
+
+那么不要只执行：
+
+```bash
+docker compose pull codex2api
+```
+
+因为这只会拉镜像，不会把刚 `git pull` 下来的前后端源码重新构建进容器，结果就会出现“后端代码更新了，但 UI 还是旧版本”的现象。
+
+推荐更新方式：
+
+```bash
+cd /opt/codex2api
+git pull origin main
+
+docker stop codex2api || true
+docker rm codex2api || true
+
+docker build -t ghcr.io/james-6-23/codex2api:latest .
+docker compose up -d --no-deps codex2api
+
+docker logs --tail=100 -f codex2api
+curl http://127.0.0.1:${CODEX_PORT:-8080}/health
+```
+
+### 外部 1Panel PostgreSQL / Redis
+
+如果 `.env` 中的 `DATABASE_HOST` / `REDIS_ADDR` 指向外部 1Panel 容器名，则 `codex2api` 必须加入对应外部 Docker 网络，否则容器内无法解析这些主机名。
+
+示例 `docker-compose.override.yml`：
+
+```yaml
+services:
+  codex2api:
+    networks:
+      - codex2api-net
+      - panel_net
+
+networks:
+  panel_net:
+    external: true
+    name: 1panel-network
+```
+
+这只是在网络层连通旧中间件，不会替换或重建你原来的数据库和 Redis。

@@ -509,6 +509,122 @@ func TestUpdateSettingsRequiresAdminSecretBeforeEnablingRemoteMigration(t *testi
 	}
 }
 
+func TestUpdateSettingsReappliesEnvOverridesAfterSave(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("MAX_CONCURRENCY", "9")
+
+	handler, db := newSettingsTestHandler(t)
+	t.Cleanup(func() { _ = db.Close() })
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		bytes.NewBufferString(`{"max_concurrency":5}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateSettings(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if got := handler.store.GetMaxConcurrency(); got != 9 {
+		t.Fatalf("runtime max concurrency = %d, want %d", got, 9)
+	}
+
+	settings, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings() error: %v", err)
+	}
+	if settings.MaxConcurrency != 5 {
+		t.Fatalf("persisted max concurrency = %d, want %d", settings.MaxConcurrency, 5)
+	}
+
+	var payload settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.MaxConcurrency != 9 {
+		t.Fatalf("response max concurrency = %d, want %d", payload.MaxConcurrency, 9)
+	}
+}
+
+func TestUpdateSettingsKeepsDatabaseFallbackForUnchangedEnvControlledFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("MAX_CONCURRENCY", "9")
+
+	handler, db := newSettingsTestHandler(t)
+	t.Cleanup(func() { _ = db.Close() })
+
+	if err := db.UpdateSystemSettings(context.Background(), &database.SystemSettings{
+		MaxConcurrency:                  3,
+		GlobalRPM:                       60,
+		TestModel:                       "gpt-5.4",
+		TestConcurrency:                 50,
+		PgMaxConns:                      50,
+		RedisPoolSize:                   30,
+		RefreshScanEnabled:              true,
+		RefreshScanIntervalSeconds:      120,
+		RefreshPreExpireSeconds:         300,
+		RefreshMaxConcurrency:           10,
+		RefreshOnImportEnabled:          true,
+		RefreshOnImportConcurrency:      10,
+		UsageProbeEnabled:               true,
+		UsageProbeStaleAfterSeconds:     600,
+		UsageProbeMaxConcurrency:        4,
+		RecoveryProbeEnabled:            true,
+		RecoveryProbeMinIntervalSeconds: 1800,
+		RecoveryProbeMaxConcurrency:     2,
+	}); err != nil {
+		t.Fatalf("UpdateSystemSettings() error: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		bytes.NewBufferString(`{"global_rpm":120}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateSettings(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if got := handler.store.GetMaxConcurrency(); got != 9 {
+		t.Fatalf("runtime max concurrency = %d, want %d", got, 9)
+	}
+	if got := handler.rateLimiter.GetRPM(); got != 120 {
+		t.Fatalf("runtime global rpm = %d, want %d", got, 120)
+	}
+
+	settings, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings() error: %v", err)
+	}
+	if settings.MaxConcurrency != 3 {
+		t.Fatalf("persisted max concurrency = %d, want %d", settings.MaxConcurrency, 3)
+	}
+	if settings.GlobalRPM != 120 {
+		t.Fatalf("persisted global rpm = %d, want %d", settings.GlobalRPM, 120)
+	}
+
+	var payload settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.MaxConcurrency != 9 {
+		t.Fatalf("response max concurrency = %d, want %d", payload.MaxConcurrency, 9)
+	}
+	if payload.GlobalRPM != 120 {
+		t.Fatalf("response global rpm = %d, want %d", payload.GlobalRPM, 120)
+	}
+}
+
 type wrappedAccountNotFoundError struct{}
 
 func (wrappedAccountNotFoundError) Error() string {

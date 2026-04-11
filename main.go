@@ -91,6 +91,9 @@ func main() {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
 			security.SanitizeLog(settings.ProxyURL), settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
 	}
+	if appliedOverrides := config.ApplySystemSettingsEnvOverrides(settings); len(appliedOverrides) > 0 {
+		log.Printf("宸插簲鐢? .env 杩愯閰嶇疆瑕嗙洊: %s", strings.Join(appliedOverrides, ", "))
+	}
 	if strings.TrimSpace(cfg.AdminSecret) == "" && (settings == nil || strings.TrimSpace(settings.AdminSecret) == "") {
 		log.Fatal("ADMIN_SECRET ??????????????????????????")
 	}
